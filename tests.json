@@ -1,0 +1,840 @@
+{
+  "version": 4,
+  "status": "phase_1_1_implemented",
+  "note": "Phase 0, Phase 1 (Core Lead Management), and Phase 1.1 (Lead business-rules closure: optional ownership, email normalization, duplicate/soft-delete semantics) tests are implemented. Full suite: 142 tests / 16 files, 131 passing, 11 failing — the 11 failures are pre-existing and unrelated to any Lead work (tests/integration/session-tenancy.test.ts and tests/integration/auth-lookup-security-definer.test.ts; auth/session infra). The focused Lead suite (tests/unit/leads-service.test.ts, tests/unit/csv.test.ts, tests/integration/lead-rls.test.ts) is 57/57 passing. Phase 1's create/search/detail/edit/delete/CSV-import/tenant-isolation flow was additionally verified manually end-to-end against real PostgreSQL (no automated browser e2e runner exists — see leads-15). Phase 2+ entries remain a plan. Runner: Vitest; database tests use PGlite (real PostgreSQL via WASM) with the project's actual migrations applied.",
+  "runner": {
+    "framework": "vitest",
+    "command": "npm test",
+    "projects": {
+      "node": "tests/{unit,integration}/**/*.test.ts — logic, security, database/RLS",
+      "jsdom": "tests/components/**/*.test.tsx — React components"
+    },
+    "lastRun": {
+      "date": "2026-09-01",
+      "files": 16,
+      "passed": 131,
+      "failed": 11,
+      "knownFailures": "session-tenancy.test.ts (5) and auth-lookup-security-definer.test.ts (6) — pre-existing, unrelated to any Lead work, not yet investigated"
+    }
+  },
+  "suites": [
+    {
+      "id": "auth-1",
+      "phase": 0,
+      "type": "e2e",
+      "feature": "auth",
+      "description": "User can sign up, verify email, log in, and log out",
+      "priority": "high",
+      "status": "partial",
+      "file": "tests/integration/auth-credentials.test.ts",
+      "note": "Credential sign-in/rejection verified against the real schema in PGlite. Email verification is NOT implemented. Manual smoke test (Signup → Login → Authenticated Dashboard → Logout → Protected route blocked) passed end-to-end against real PostgreSQL on 2026-09-01, after fixing a session/tenant bug in lib/auth/session.ts; no automated browser-level e2e runner exists yet in Phase 0."
+    },
+    {
+      "id": "auth-2",
+      "phase": 0,
+      "type": "unit",
+      "feature": "auth",
+      "description": "Invite flow creates org-scoped user with correct default role",
+      "priority": "high",
+      "status": "not_started",
+      "note": "Invite flow is not implemented in Phase 0 — deferred to Phase 7 (settings/users)."
+    },
+    {
+      "id": "tenancy-1",
+      "phase": 0,
+      "type": "integration",
+      "feature": "multi-tenancy",
+      "description": "Query layer rejects/omits rows from a different org_id even when IDs are guessed",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/session-tenancy.test.ts"
+    },
+    {
+      "id": "tenancy-2",
+      "phase": 0,
+      "type": "integration",
+      "feature": "multi-tenancy",
+      "description": "Postgres RLS policy blocks a cross-org row read/write even when the application-layer org_id filter is bypassed (e.g., a raw query missing the filter)",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/rls-tenant-isolation.test.ts"
+    },
+    {
+      "id": "tenancy-3",
+      "phase": 0,
+      "type": "unit",
+      "feature": "multi-tenancy",
+      "description": "Every tenant table (including LeadEnrichment, AIInsight, EmailEvent, CampaignStep, WorkflowRunStep) has a non-null org_id column and an RLS policy",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/rls-tenant-isolation.test.ts"
+    },
+    {
+      "id": "leads-1",
+      "phase": 1,
+      "type": "unit",
+      "feature": "leads",
+      "description": "Create/read/update/delete a Lead respects org scoping",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/leads-service.test.ts"
+    },
+    {
+      "id": "leads-2",
+      "phase": 1,
+      "type": "e2e",
+      "feature": "leads",
+      "description": "Leads table filters by source, qualification, and status correctly",
+      "priority": "medium",
+      "status": "partial",
+      "note": "Filter logic covered by tests/unit/leads-service.test.ts (source/status/qualification filters on listLeads). Live browser confirmation of the UI filter controls on real data was not part of the 2026-09-01 manual E2E pass (that pass exercised search, not the Status/Qualification/Source dropdowns) and no automated browser e2e runner exists."
+    },
+    {
+      "id": "leads-3",
+      "phase": 1,
+      "type": "integration",
+      "feature": "leads-import",
+      "description": "CSV import reports per-row validation errors without failing the whole batch",
+      "priority": "medium",
+      "status": "passing",
+      "file": "tests/unit/leads-service.test.ts",
+      "note": "Also confirmed live against real PostgreSQL on 2026-09-01 (2 valid + 1 invalid row: 2 created, invalid row reported by row number/email)."
+    },
+    {
+      "id": "leads-4",
+      "phase": 1,
+      "type": "e2e",
+      "feature": "leads",
+      "description": "Empty state renders when org has zero leads",
+      "priority": "low",
+      "status": "passing",
+      "note": "Confirmed live against real PostgreSQL on 2026-09-01 (\"No leads match your filters\" / zero-lead empty state rendered after soft-deleting all leads). No automated browser e2e test exists for this."
+    },
+    {
+      "id": "leads-5",
+      "phase": 1,
+      "type": "integration",
+      "feature": "leads",
+      "description": "A second submission with the same (org_id, email) updates the existing Lead instead of creating a duplicate",
+      "priority": "high",
+      "status": "not_started",
+      "note": "SUPERSEDED by a deliberate Phase 1.1 product decision, not a bug: reject-on-duplicate (ConflictError) is the specified MVP behavior (docs/product-spec.md §5 \"Duplicate semantics\"), not upsert. This entry's upsert description is intentionally not implemented. See leads-20 for the test coverage of the decided (reject) behavior."
+    },
+    {
+      "id": "leads-6",
+      "phase": 1,
+      "type": "integration",
+      "feature": "leads",
+      "description": "Manually created and CSV-imported leads do not enqueue a WorkflowRun; webhook/form-captured leads do",
+      "priority": "high",
+      "status": "partial",
+      "file": "tests/unit/leads-service.test.ts",
+      "note": "The \"do not enqueue\" half is verified (see leads-14) — trivially true since no workflow engine exists yet. The \"webhook/form leads do enqueue\" half is not_started: that requires Phase 2 (Automation Pipeline Engine), which is not built."
+    },
+    {
+      "id": "leads-7",
+      "phase": 1,
+      "type": "integration",
+      "feature": "leads",
+      "description": "Lead table has RLS enabled and forced, with a tenant-isolation policy verified against the real (non-superuser, non-BYPASSRLS) leadflow_app role",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/lead-rls.test.ts"
+    },
+    {
+      "id": "leads-8",
+      "phase": 1,
+      "type": "integration",
+      "feature": "leads",
+      "description": "Lead email uniqueness is scoped per organization: rejected as a duplicate within the same org, allowed to repeat in a different org",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/lead-rls.test.ts"
+    },
+    {
+      "id": "leads-9",
+      "phase": 1,
+      "type": "integration",
+      "feature": "leads",
+      "description": "Deleting a Lead sets deletedAt and excludes it from normal listings without physically removing the row",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/lead-rls.test.ts"
+    },
+    {
+      "id": "leads-10",
+      "phase": 1,
+      "type": "unit",
+      "feature": "rbac",
+      "description": "SALES_REP read/list is scoped to owned leads; ADMIN/MANAGER see and edit all; a rep cannot reassign a lead to someone else or create one already owned by someone else",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/leads-service.test.ts"
+    },
+    {
+      "id": "leads-11",
+      "phase": 1,
+      "type": "unit",
+      "feature": "leads",
+      "description": "listLeads supports pagination, filtering (source/status/qualification/owner), search (name/email/company), and sorting",
+      "priority": "medium",
+      "status": "passing",
+      "file": "tests/unit/leads-service.test.ts"
+    },
+    {
+      "id": "leads-12",
+      "phase": 1,
+      "type": "unit",
+      "feature": "leads",
+      "description": "A SALES_REP cannot update or delete a Lead owned by another rep; a tenant cannot update or soft-delete another tenant's Lead",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/leads-service.test.ts"
+    },
+    {
+      "id": "leads-13",
+      "phase": 1,
+      "type": "unit",
+      "feature": "leads-import",
+      "description": "CSV import rejects any unrecognized column (including a smuggled organizationId) by failing the whole file, rather than silently ignoring it",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/csv.test.ts",
+      "note": "Also confirmed live: a CSV with an `organizationId` column was rejected outright with \"Unrecognized column(s): organizationid.\" and zero leads were created."
+    },
+    {
+      "id": "leads-14",
+      "phase": 1,
+      "type": "unit",
+      "feature": "leads-import",
+      "description": "CSV-imported leads never trigger a workflow/outbound side effect (status stays NEW, qualification/aiScore stay null, no automation module exists to enroll into)",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/leads-service.test.ts"
+    },
+    {
+      "id": "leads-15",
+      "phase": 1,
+      "type": "e2e",
+      "feature": "leads",
+      "description": "Full Leads flow (create, search, view detail, edit, refresh, soft-delete, refresh, CSV import with valid+invalid rows, tenant isolation) works end-to-end against a real PostgreSQL database",
+      "priority": "high",
+      "status": "passing",
+      "note": "Manual pass via browser automation on 2026-09-01, cross-checked with direct SQL after each step. Tenant isolation was verified at the RLS layer using the real leadflow_app role rather than switching the browser's authenticated session (no second account's credentials were available, and doing so risked signing the developer out with no way back in). Found and fixed one real bug during this pass: duplicate-email detection didn't recognize the constraint-name shape @prisma/adapter-pg reports against real Postgres (see progress.md log entry). No automated browser-level e2e runner exists — this is not a repeatable CI test."
+    },
+    {
+      "id": "leads-16",
+      "phase": 1,
+      "type": "unit",
+      "feature": "leads",
+      "description": "A Lead may be created (or updated) with ownerId explicitly null (\"Unassigned\"); omitting ownerId keeps the existing default-to-self behavior unchanged; no fake system owner or auto-assignment is ever invented",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/leads-service.test.ts",
+      "note": "Also verified at the schema/DB layer: tests/integration/lead-rls.test.ts inserts a Lead with a NULL ownerId directly, and a live smoke check confirmed the same against the real dev database after the migration."
+    },
+    {
+      "id": "leads-17",
+      "phase": 1,
+      "type": "unit",
+      "feature": "leads",
+      "description": "Email is normalized (trimmed, lowercased) before persistence/comparison, consistently on create, update, and CSV import",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/leads-service.test.ts"
+    },
+    {
+      "id": "leads-18",
+      "phase": 1,
+      "type": "unit",
+      "feature": "leads",
+      "description": "A syntactically invalid email is rejected with a clear validation error on create/update/import",
+      "priority": "medium",
+      "status": "passing",
+      "file": "tests/unit/leads-service.test.ts"
+    },
+    {
+      "id": "leads-19",
+      "phase": 1,
+      "type": "integration",
+      "feature": "leads",
+      "description": "A soft-deleted Lead retains its email identity: it is excluded from get/search/list, and its (normalized) email cannot be reused by a second Lead in the same organization",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/leads-service.test.ts",
+      "note": "Real-Postgres equivalent (insert -> soft-delete -> re-insert same email, expect unique-constraint rejection) in tests/integration/lead-rls.test.ts."
+    },
+    {
+      "id": "leads-20",
+      "phase": 1,
+      "type": "unit",
+      "feature": "leads",
+      "description": "Duplicate-email detection (create, update, and CSV import) correctly recognizes the real @prisma/adapter-pg P2002 error shape (constraint name nested under meta.driverAdapterError.cause.constraint.index), not just Prisma's classic meta.target array",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/leads-service.test.ts",
+      "note": "Regression coverage for the bug found and fixed during the 2026-09-01 Phase 1 E2E smoke test — the test fake's uniqueEmailViolation() helper was updated to match the real driver-reported shape rather than the previously-assumed classic shape."
+    },
+    {
+      "id": "workflow-1",
+      "phase": 2,
+      "type": "integration",
+      "feature": "workflow-engine",
+      "description": "New lead webhook enqueues a WorkflowRun and executes all 7 steps in order with stub providers",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "workflow-2",
+      "phase": 2,
+      "type": "integration",
+      "feature": "workflow-engine",
+      "description": "A failed step marks WorkflowRunStep=failed, halts downstream steps, and supports manual retry",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "workflow-3",
+      "phase": 2,
+      "type": "e2e",
+      "feature": "workflow-engine",
+      "description": "Workflow stepper UI reflects live run status (pending/running/success/failed) per step",
+      "priority": "medium",
+      "status": "not_started"
+    },
+    {
+      "id": "workflow-4",
+      "phase": 2,
+      "type": "unit",
+      "feature": "workflow-engine",
+      "description": "Retries use backoff and stop after configured max attempts",
+      "priority": "medium",
+      "status": "not_started"
+    },
+    {
+      "id": "workflow-5",
+      "phase": 2,
+      "type": "integration",
+      "feature": "workflow-engine",
+      "description": "A duplicate webhook delivery for the same lead does not start a second concurrent WorkflowRun (dedup_key uniqueness holds)",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "workflow-6",
+      "phase": 2,
+      "type": "integration",
+      "feature": "workflow-engine",
+      "description": "Retrying a step that already completed its external side effect (e.g., email already sent) does not repeat that side effect",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "workflow-7",
+      "phase": 2,
+      "type": "unit",
+      "feature": "workflow-engine",
+      "description": "A run stuck on a step with no connected required provider reaches status=blocked, not stuck running or wrongly failed",
+      "priority": "medium",
+      "status": "not_started"
+    },
+    {
+      "id": "workflow-8",
+      "phase": 2,
+      "type": "integration",
+      "feature": "abuse-prevention",
+      "description": "Lead-capture webhook endpoint enforces a rate limit per API key/source",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "enrich-1",
+      "phase": 3,
+      "type": "integration",
+      "feature": "enrichment",
+      "description": "Enrichment provider call (vendor TBD, behind pluggable interface) populates LeadEnrichment and handles timeout/error gracefully",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "enrich-2",
+      "phase": 3,
+      "type": "integration",
+      "feature": "enrichment",
+      "description": "Pipeline skips (not fails) the enrich step when no enrichment provider is connected",
+      "priority": "medium",
+      "status": "not_started"
+    },
+    {
+      "id": "ai-1",
+      "phase": 3,
+      "type": "integration",
+      "feature": "ai-qualification",
+      "description": "OpenAI call produces ai_score, summary, keywords, recommended action for a given lead payload",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "ai-2",
+      "phase": 3,
+      "type": "unit",
+      "feature": "ai-qualification",
+      "description": "Score-to-qualification thresholds are configurable per org and applied correctly",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "ai-3",
+      "phase": 3,
+      "type": "integration",
+      "feature": "ai-qualification",
+      "description": "OpenAI failure/rate-limit does not fail the whole workflow run; step marked failed with retry",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "ai-4",
+      "phase": 3,
+      "type": "unit",
+      "feature": "ai-qualification",
+      "description": "Token usage per lead is recorded for cost monitoring",
+      "priority": "low",
+      "status": "not_started"
+    },
+    {
+      "id": "ai-5",
+      "phase": 3,
+      "type": "unit",
+      "feature": "ai-qualification",
+      "description": "Malformed/unschema'd OpenAI output leaves ai_score null and flags the lead for manual review instead of guessing a score",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "ai-6",
+      "phase": 3,
+      "type": "integration",
+      "feature": "ai-cost-control",
+      "description": "Exceeding an org's monthly AI budget blocks further qualification calls with an in-app notice rather than silently continuing",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "ai-7",
+      "phase": 3,
+      "type": "integration",
+      "feature": "ai-cost-control",
+      "description": "POST /api/ai/regenerate-insight/:leadId is rate-limited per lead",
+      "priority": "medium",
+      "status": "not_started"
+    },
+    {
+      "id": "email-1",
+      "phase": 4,
+      "type": "integration",
+      "feature": "campaigns",
+      "description": "AI-drafted email is generated and sent via the configured email provider (vendor TBD, behind pluggable interface); EmailEvent(sent) logged",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "email-4",
+      "phase": 4,
+      "type": "integration",
+      "feature": "campaigns",
+      "description": "Send-email step is surfaced as blocked (not silently skipped) when no email provider is connected",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "email-2",
+      "phase": 4,
+      "type": "integration",
+      "feature": "campaigns",
+      "description": "Provider webhook for open/reply updates EmailEvent and Lead.status",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "email-3",
+      "phase": 4,
+      "type": "e2e",
+      "feature": "campaigns",
+      "description": "Campaign builder creates a multi-step sequence with delays",
+      "priority": "medium",
+      "status": "not_started"
+    },
+    {
+      "id": "notify-1",
+      "phase": 5,
+      "type": "integration",
+      "feature": "notifications",
+      "description": "Slack notification sent on step 7; in-app Notification row created even if Slack disconnected",
+      "priority": "medium",
+      "status": "not_started"
+    },
+    {
+      "id": "sync-1",
+      "phase": 5,
+      "type": "integration",
+      "feature": "airtable-sync",
+      "description": "Airtable sync failure does not fail the workflow run (non-blocking)",
+      "priority": "medium",
+      "status": "not_started"
+    },
+    {
+      "id": "sync-2",
+      "phase": 5,
+      "type": "integration",
+      "feature": "airtable-sync",
+      "description": "Retrying the Airtable sync step upserts by stable external id rather than creating a duplicate record",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "notify-2",
+      "phase": 5,
+      "type": "unit",
+      "feature": "notifications",
+      "description": "Slack notification DMs the lead owner when User.slackUserId is set, otherwise falls back to the default channel",
+      "priority": "low",
+      "status": "not_started"
+    },
+    {
+      "id": "integrations-1",
+      "phase": 5,
+      "type": "e2e",
+      "feature": "integrations",
+      "description": "Connect/disconnect flow updates Integration.status and blocks dependent workflow steps when disconnected",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "dashboard-1",
+      "phase": 6,
+      "type": "e2e",
+      "feature": "dashboard",
+      "description": "StatCards, donut chart, and leads-over-time chart render correct values for a given date range",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "dashboard-2",
+      "phase": 6,
+      "type": "unit",
+      "feature": "analytics",
+      "description": "DailyMetric rollup job computes correct aggregates from raw Lead/EmailEvent data",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "dashboard-3",
+      "phase": 6,
+      "type": "e2e",
+      "feature": "analytics",
+      "description": "CSV/PDF export matches on-screen data for selected range",
+      "priority": "low",
+      "status": "not_started"
+    },
+    {
+      "id": "dashboard-4",
+      "phase": 6,
+      "type": "integration",
+      "feature": "analytics",
+      "description": "Dashboard's current-day metrics are computed live and do not show stale/zero data before the nightly DailyMetric rollup runs",
+      "priority": "medium",
+      "status": "not_started"
+    },
+    {
+      "id": "dashboard-5",
+      "phase": 6,
+      "type": "e2e",
+      "feature": "analytics",
+      "description": "A zero-activity date range renders a 0%/flat state, not a divide-by-zero delta",
+      "priority": "low",
+      "status": "not_started"
+    },
+    {
+      "id": "perm-1",
+      "phase": 7,
+      "type": "integration",
+      "feature": "rbac",
+      "description": "Sales Rep cannot access another rep's leads via API even with a valid session",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "perm-2",
+      "phase": 7,
+      "type": "integration",
+      "feature": "rbac",
+      "description": "Manager cannot access /settings/billing or /integrations",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "perm-3",
+      "phase": 7,
+      "type": "e2e",
+      "feature": "rbac",
+      "description": "RoleGate hides/shows nav items and actions per role in the UI",
+      "priority": "medium",
+      "status": "not_started"
+    },
+    {
+      "id": "security-1",
+      "phase": 8,
+      "type": "integration",
+      "feature": "security",
+      "description": "Inbound webhook rejects requests with invalid/missing signature",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "security-2",
+      "phase": 8,
+      "type": "integration",
+      "feature": "security",
+      "description": "Integration credentials are never returned in any API response payload",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "load-1",
+      "phase": 8,
+      "type": "load",
+      "feature": "workflow-engine",
+      "description": "Queue sustains a burst of N concurrent lead-capture events without dropping runs, and dedup/idempotency holds under duplicate delivery at load",
+      "priority": "medium",
+      "status": "not_started"
+    },
+    {
+      "id": "states-1",
+      "phase": 8,
+      "type": "e2e",
+      "feature": "ui-states",
+      "description": "Every major page has verified loading, error, and empty states per product-spec.md",
+      "priority": "medium",
+      "status": "not_started"
+    },
+    {
+      "id": "gdpr-1",
+      "phase": 8,
+      "type": "integration",
+      "feature": "data-deletion",
+      "description": "Deleting a Lead hard-deletes its PII-bearing child rows (LeadEnrichment, AIInsight, EmailEvent bodies) while retaining anonymized WorkflowRunStep counts",
+      "priority": "high",
+      "status": "not_started"
+    },
+    {
+      "id": "auth-3",
+      "phase": 0,
+      "type": "integration",
+      "feature": "auth",
+      "description": "Password is stored only as a bcrypt hash, never plaintext",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/auth-credentials.test.ts"
+    },
+    {
+      "id": "auth-4",
+      "phase": 0,
+      "type": "integration",
+      "feature": "auth",
+      "description": "Email uniqueness is enforced by a database constraint, not only application code",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/auth-credentials.test.ts"
+    },
+    {
+      "id": "auth-5",
+      "phase": 0,
+      "type": "integration",
+      "feature": "auth",
+      "description": "A new user defaults to the least-privileged role (SALES_REP)",
+      "priority": "medium",
+      "status": "passing",
+      "file": "tests/integration/auth-credentials.test.ts"
+    },
+    {
+      "id": "auth-6",
+      "phase": 0,
+      "type": "integration",
+      "feature": "auth",
+      "description": "A user referencing a non-existent organization is refused by the foreign key",
+      "priority": "medium",
+      "status": "passing",
+      "file": "tests/integration/auth-credentials.test.ts"
+    },
+    {
+      "id": "auth-7",
+      "phase": 0,
+      "type": "integration",
+      "feature": "auth",
+      "description": "Deleting an organization cascades to its users",
+      "priority": "medium",
+      "status": "passing",
+      "file": "tests/integration/auth-credentials.test.ts"
+    },
+    {
+      "id": "tenancy-4",
+      "phase": 0,
+      "type": "integration",
+      "feature": "multi-tenancy",
+      "description": "A tenant cannot read, update or delete another tenant row even with the exact primary key",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/rls-tenant-isolation.test.ts"
+    },
+    {
+      "id": "tenancy-5",
+      "phase": 0,
+      "type": "integration",
+      "feature": "multi-tenancy",
+      "description": "An INSERT attributing a row to another organization is rejected by the WITH CHECK policy",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/rls-tenant-isolation.test.ts"
+    },
+    {
+      "id": "tenancy-6",
+      "phase": 0,
+      "type": "integration",
+      "feature": "multi-tenancy",
+      "description": "Queries with no tenant context return zero rows (fails closed, never open)",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/rls-tenant-isolation.test.ts"
+    },
+    {
+      "id": "tenancy-7",
+      "phase": 0,
+      "type": "integration",
+      "feature": "multi-tenancy",
+      "description": "Tenant context does not leak between transactions on the same connection (pool-safe)",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/rls-tenant-isolation.test.ts"
+    },
+    {
+      "id": "tenancy-8",
+      "phase": 0,
+      "type": "unit",
+      "feature": "multi-tenancy",
+      "description": "withTenant sets tenant context before running work, binds the org id as a parameter, and rejects an empty org id",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/tenant-db.test.ts"
+    },
+    {
+      "id": "tenancy-9",
+      "phase": 0,
+      "type": "integration",
+      "feature": "multi-tenancy",
+      "description": "Session resolution re-reads the user from the database, so a stale token cannot retain a role or switch organization",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/session-tenancy.test.ts"
+    },
+    {
+      "id": "tenancy-10",
+      "phase": 0,
+      "type": "integration",
+      "feature": "multi-tenancy",
+      "description": "A soft-deleted organization immediately revokes access",
+      "priority": "medium",
+      "status": "passing",
+      "file": "tests/integration/session-tenancy.test.ts"
+    },
+    {
+      "id": "rbac-1",
+      "phase": 0,
+      "type": "unit",
+      "feature": "rbac",
+      "description": "Capability matrix matches product-spec.md §11 for all three roles",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/rbac.test.ts"
+    },
+    {
+      "id": "rbac-2",
+      "phase": 0,
+      "type": "integration",
+      "feature": "rbac",
+      "description": "requireCapability refuses a SALES_REP server-side, independently of UI filtering",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/session-tenancy.test.ts"
+    },
+    {
+      "id": "rbac-3",
+      "phase": 0,
+      "type": "components",
+      "feature": "rbac",
+      "description": "Sidebar renders only permitted destinations and marks the active route",
+      "priority": "medium",
+      "status": "passing",
+      "file": "tests/components/sidebar-nav.test.tsx"
+    },
+    {
+      "id": "env-1",
+      "phase": 0,
+      "type": "unit",
+      "feature": "configuration",
+      "description": "Required env vars are enforced; a non-PostgreSQL DATABASE_URL and a short AUTH_SECRET are rejected",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/env.test.ts"
+    },
+    {
+      "id": "env-2",
+      "phase": 0,
+      "type": "unit",
+      "feature": "configuration",
+      "description": "Application validates successfully with NO optional integration credentials present",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/env.test.ts"
+    },
+    {
+      "id": "errors-1",
+      "phase": 0,
+      "type": "unit",
+      "feature": "error-handling",
+      "description": "Unknown errors never leak their message; AppError logContext is never serialised to a client",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/errors.test.ts"
+    },
+    {
+      "id": "logging-1",
+      "phase": 0,
+      "type": "unit",
+      "feature": "logging",
+      "description": "Logger redacts secrets and reduces PII to a presence marker, including nested and differently-cased keys",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/unit/logger.test.ts"
+    },
+    {
+      "id": "validation-1",
+      "phase": 0,
+      "type": "unit",
+      "feature": "validation",
+      "description": "Sign-up input is validated and email normalised; org slug is URL-safe, bounded and never empty",
+      "priority": "medium",
+      "status": "passing",
+      "file": "tests/unit/validation.test.ts"
+    },
+    {
+      "id": "db-1",
+      "phase": 0,
+      "type": "integration",
+      "feature": "database",
+      "description": "All Prisma migrations apply cleanly to a real PostgreSQL instance",
+      "priority": "high",
+      "status": "passing",
+      "file": "tests/integration/rls-tenant-isolation.test.ts"
+    }
+  ]
+}
