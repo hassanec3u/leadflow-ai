@@ -232,8 +232,8 @@ function applyStepResult(state: PipelineState, step: WorkflowStepKind, result: S
   if (result.status === 'FAILED' && isCriticalStep(step)) {
     state.terminal = { status: 'FAILED', step, errorCode: result.errorCode ?? null }
   }
-  // A non-critical failure (ADD_TO_CRM, NOTIFY_TEAM) is recorded on its own
-  // row and the pipeline continues — the run can still succeed.
+  // A non-critical failure (NOTIFY_TEAM) is recorded on its own row and the
+  // pipeline continues — the run can still succeed.
 }
 
 async function recordSkippedStep(
@@ -442,17 +442,14 @@ async function performStep(
       }
     }
 
-    case 'ADD_TO_CRM': {
-      if (!providers.crm) {
-        return { status: 'SKIPPED', errorCode: STEP_REASON.providerNotConfigured }
-      }
-      const result = await providers.crm.upsertLead({
-        ...call,
-        lead: state.lead,
-        aiScore: state.ai?.score ?? null,
-      })
-      return { status: 'SUCCEEDED', output: { recordId: result.recordId } }
-    }
+    // ADD_TO_CRM is retired: it no longer appears in PIPELINE_STEPS
+    // (lib/automation/pipeline.ts), so performStep is never called with it
+    // for a real run — this case exists solely because WorkflowStepKind
+    // (the Prisma/DB enum) still carries the value for historical
+    // WorkflowStepRun rows, and TypeScript requires this switch to stay
+    // exhaustive over that type. It is unreachable in practice.
+    case 'ADD_TO_CRM':
+      throw new Error('ADD_TO_CRM is retired and is never scheduled by PIPELINE_STEPS')
 
     case 'SEND_EMAIL': {
       // Threshold first: an unqualified lead is never emailed, whether or not

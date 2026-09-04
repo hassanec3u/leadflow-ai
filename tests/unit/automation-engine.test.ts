@@ -2,7 +2,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type {
   AiQualificationProvider,
-  CrmSyncProvider,
   EmailProvider,
   EnrichmentProvider,
   NotificationProvider,
@@ -388,11 +387,6 @@ function makeAi(score = 85): AiQualificationProvider & { qualify: ReturnType<typ
   return { name: 'fake-ai', qualify } as never
 }
 
-function makeCrm(): CrmSyncProvider & { upsertLead: ReturnType<typeof vi.fn> } {
-  const upsertLead = vi.fn(async () => ({ recordId: 'rec_1' }))
-  return { name: 'fake-crm', upsertLead } as never
-}
-
 function makeEmail(): EmailProvider & { send: ReturnType<typeof vi.fn> } {
   const send = vi.fn(async () => ({ providerMessageId: 'msg_1' }))
   return { name: 'fake-email', send } as never
@@ -407,7 +401,6 @@ function makeRegistry(overrides: Partial<ProviderRegistry> = {}): ProviderRegist
   return {
     enrichment: makeEnrichment(),
     ai: makeAi(),
-    crm: makeCrm(),
     email: makeEmail(),
     notification: makeNotification(),
     aiBudget: null,
@@ -499,16 +492,11 @@ describe('Automation execution engine', () => {
     )
 
     expect(result.runStatus).toBe('SUCCEEDED')
-    for (const step of [
-      'ENRICH',
-      'AI_QUALIFY',
-      'SCORE_AND_TAG',
-      'ADD_TO_CRM',
-      'SEND_EMAIL',
-      'NOTIFY_TEAM',
-    ]) {
+    for (const step of ['ENRICH', 'AI_QUALIFY', 'SCORE_AND_TAG', 'SEND_EMAIL', 'NOTIFY_TEAM']) {
       expect(stepStatus(run.id, step)?.status).toBe('SUCCEEDED')
     }
+    // ADD_TO_CRM is retired — a fresh run creates no row for it at all.
+    expect(stepStatus(run.id, 'ADD_TO_CRM')).toBeUndefined()
     expect(state.leads.find((l) => l.id === lead.id)?.aiScore).toBe(85)
     expect(state.leads.find((l) => l.id === lead.id)?.qualificationOutcome).toBe('QUALIFIED')
     expect(state.leads.find((l) => l.id === lead.id)?.qualificationSource).toBe('AI')
@@ -709,7 +697,7 @@ describe('Automation execution engine', () => {
     expect(result.runStatus).toBe('FAILED')
     expect(stepStatus(run.id, 'ENRICH')?.status).toBe('FAILED')
     expect(stepStatus(run.id, 'ENRICH')?.attempts).toBe(3)
-    for (const step of ['AI_QUALIFY', 'SCORE_AND_TAG', 'ADD_TO_CRM', 'SEND_EMAIL', 'NOTIFY_TEAM']) {
+    for (const step of ['AI_QUALIFY', 'SCORE_AND_TAG', 'SEND_EMAIL', 'NOTIFY_TEAM']) {
       expect(stepStatus(run.id, step)?.status).toBe('SKIPPED')
       expect(stepStatus(run.id, step)?.errorCode).toBe('upstream_failed')
     }
@@ -806,22 +794,10 @@ describe('Automation execution engine', () => {
     expect(result.runStatus).toBe('SUCCEEDED')
   })
 
-  it('12. CRM failure is non-blocking: step FAILED, pipeline continues, run SUCCEEDED', async () => {
-    const { executeWorkflowRun } = await importEngine()
-    const { run } = seedRun()
-    const crm = makeCrm()
-    crm.upsertLead.mockRejectedValue(new Error('airtable 503'))
-    const providers = makeRegistry({ crm })
-
-    const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
-
-    expect(stepStatus(run.id, 'ADD_TO_CRM')?.status).toBe('FAILED')
-    expect(stepStatus(run.id, 'SEND_EMAIL')?.status).toBe('SUCCEEDED')
-    expect(result.runStatus).toBe('SUCCEEDED')
-  })
+  // 12. Formerly "CRM failure is non-blocking" — ADD_TO_CRM is retired (see
+  // lib/automation/pipeline.ts). The general rule it proved (a non-critical
+  // step's failure does not fail the run) is still covered by the NOTIFY_TEAM
+  // failure case below.
 
   it('13. qualified lead + no email provider: SEND_EMAIL BLOCKED and run BLOCKED', async () => {
     const { executeWorkflowRun } = await importEngine()
@@ -1003,6 +979,26 @@ describe('Automation execution engine', () => {
     expect(emitRunRequestedMock).toHaveBeenCalledWith(
       expect.objectContaining({ runId: rerun.id, trigger: 'MANUAL_RERUN' }),
     )
+  })
+
+  it('24a. a manual re-run executes exactly the five current pipeline steps, no ADD_TO_CRM row', async () => {
+    const { executeWorkflowRun } = await importEngine()
+    const { requestManualRerun } = await import('@/lib/services/workflow-runs')
+    const { run } = seedRun()
+    state.runs.find((r) => r.id === run.id)!.status = 'FAILED'
+
+    const rerun = await requestManualRerun(ACME, run.id)
+    const result = await executeWorkflowRun(
+      { runId: rerun.id, organizationId: ACME },
+      { providers: makeRegistry(), sleep: noSleep },
+    )
+
+    expect(result.runStatus).toBe('SUCCEEDED')
+    const rerunSteps = state.stepRuns.filter((s) => s.workflowRunId === rerun.id)
+    expect(rerunSteps.map((s) => s.step).sort()).toEqual(
+      ['ENRICH', 'AI_QUALIFY', 'SCORE_AND_TAG', 'SEND_EMAIL', 'NOTIFY_TEAM'].sort(),
+    )
+    expect(rerunSteps.every((s) => s.status === 'SUCCEEDED')).toBe(true)
   })
 
   it('25. a manual re-run is refused while another run for the lead is active', async () => {

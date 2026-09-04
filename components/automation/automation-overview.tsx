@@ -1,10 +1,20 @@
 'use client'
 
+import { useState } from 'react'
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import { MoreVerticalIcon, WorkflowIcon } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -22,6 +32,7 @@ import {
 import { KpiCard, WorkflowStatusBadge } from '@/components/automation/automation-ui'
 import { EmptyState } from '@/components/ui/empty-state'
 import type { Kpi, WorkflowSummaryView } from '@/lib/automation/view-model'
+import { pauseWorkflowAction, resumeWorkflowAction } from '@/app/(app)/automation/actions'
 
 /**
  * Automation overview: headline metrics plus the organization's pipeline.
@@ -42,6 +53,29 @@ export function AutomationOverview({
   workflow: WorkflowSummaryView | null
   kpis: Kpi[]
 }) {
+  const router = useRouter()
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [pending, setPending] = useState(false)
+  const isPaused = workflow?.status === 'PAUSED'
+
+  /** Same shared-flag double-click guard as components/automation/workflow-detail.tsx. */
+  async function handleConfirmToggle() {
+    if (!workflow) return
+    setPending(true)
+    const action = isPaused ? resumeWorkflowAction : pauseWorkflowAction
+    const result = await action(workflow.id)
+    setPending(false)
+    setConfirmOpen(false)
+
+    if (!result.ok) {
+      toast.error(result.message)
+      return
+    }
+
+    toast.success(isPaused ? 'Workflow resumed' : 'Workflow paused')
+    router.refresh()
+  }
+
   if (!workflow) {
     return (
       <div className="p-8">
@@ -144,10 +178,8 @@ export function AutomationOverview({
                     <DropdownMenuItem asChild>
                       <Link href="/automation/runs">View runs</Link>
                     </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onClick={() => toast.info('Pausing the pipeline arrives with Phase 2')}
-                    >
-                      Pause workflow
+                    <DropdownMenuItem onClick={() => setConfirmOpen(true)} disabled={pending}>
+                      {isPaused ? 'Resume workflow' : 'Pause workflow'}
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
@@ -160,6 +192,27 @@ export function AutomationOverview({
           <p className="text-muted-foreground text-sm">Showing 1 to 1 of 1 workflow</p>
         </div>
       </section>
+
+      <Dialog open={confirmOpen} onOpenChange={(next) => !pending && setConfirmOpen(next)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{isPaused ? 'Resume this workflow?' : 'Pause this workflow?'}</DialogTitle>
+            <DialogDescription>
+              {isPaused
+                ? 'New Website Form leads will start enrolling automatically again. Runs already in progress were never affected while paused.'
+                : 'No new lead will enroll automatically while paused. Runs already in progress keep going until they finish.'}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmOpen(false)} disabled={pending}>
+              Cancel
+            </Button>
+            <Button onClick={() => void handleConfirmToggle()} disabled={pending}>
+              {pending ? 'Saving…' : isPaused ? 'Resume Workflow' : 'Pause Workflow'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

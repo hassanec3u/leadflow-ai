@@ -329,7 +329,7 @@ describe('overview', () => {
 })
 
 describe('run detail and step states', () => {
-  it('always returns the six fixed steps in pipeline order', async () => {
+  it('always returns the five fixed steps in pipeline order', async () => {
     seedRun({ id: 'run_1', organizationId: ACME, status: 'RUNNING', leadId: 'lead_acme' })
     const { getWorkflowRunDetail } = await service()
 
@@ -338,12 +338,37 @@ describe('run detail and step states', () => {
       'ENRICH',
       'AI_QUALIFY',
       'SCORE_AND_TAG',
-      'ADD_TO_CRM',
       'SEND_EMAIL',
       'NOTIFY_TEAM',
     ])
     // No row yet means not started, which is PENDING.
     expect(run?.steps.every((step) => step.state === 'PENDING')).toBe(true)
+  })
+
+  it('an old run with a historical ADD_TO_CRM WorkflowStepRun row still reads cleanly', async () => {
+    // ADD_TO_CRM is retired (lib/automation/pipeline.ts) but the DB enum
+    // still carries it for rows created before this change — nothing deletes
+    // those rows. This proves the read service does not choke on one: it
+    // simply is not one of the five keys the fixed view renders.
+    seedRun({
+      id: 'run_legacy',
+      organizationId: ACME,
+      status: 'SUCCEEDED',
+      leadId: 'lead_acme',
+      steps: [{ step: 'ADD_TO_CRM', status: 'SUCCEEDED', output: { recordId: 'rec_1' } }],
+    })
+    const { getWorkflowRunDetail } = await service()
+
+    const run = await getWorkflowRunDetail('run_legacy', NOW)
+    expect(run?.status).toBe('SUCCEEDED')
+    expect(run?.steps.map((step) => step.key)).toEqual([
+      'ENRICH',
+      'AI_QUALIFY',
+      'SCORE_AND_TAG',
+      'SEND_EMAIL',
+      'NOTIFY_TEAM',
+    ])
+    expect(run?.steps.find((step) => (step.key as string) === 'ADD_TO_CRM')).toBeUndefined()
   })
 
   it('keeps SKIPPED distinct from FAILED and BLOCKED', async () => {

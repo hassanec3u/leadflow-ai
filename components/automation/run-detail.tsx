@@ -2,6 +2,7 @@
 
 import { useState, type ReactNode } from 'react'
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import { ArrowLeftIcon, MailXIcon, RotateCcwIcon, TriangleAlertIcon } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -9,21 +10,61 @@ import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { LeadAvatar } from '@/components/leads/lead-avatar'
 import { RunStatusBadge } from '@/components/automation/automation-ui'
 import { RunSteps } from '@/components/automation/run-steps'
 import { QUALIFICATION_THRESHOLD, type WorkflowRunView } from '@/lib/automation/view-model'
+import { requestManualRerunAction } from '@/app/(app)/automation/runs/actions'
 
 /**
  * Detail of a single run: per-step outcome, metadata, trigger payload and logs.
  *
  * Every state a reviewer needs to distinguish is represented here — running,
- * completed, completed-with-email-skipped and failed. Re-run and the log view
- * are visual only in this phase.
+ * completed, completed-with-email-skipped and failed. Re-run triggers the
+ * real Manual Rerun action; the log view remains visual only in this phase.
  */
 export function RunDetail({ run, workflowName }: { run: WorkflowRunView; workflowName: string }) {
+  const router = useRouter()
   const [tab, setTab] = useState('steps')
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [rerunning, setRerunning] = useState(false)
+
+  /**
+   * One shared handler behind both "Re-run Workflow" buttons (the failed
+   * callout and the summary card): a single `rerunning` flag disables both at
+   * once, so a double click — either on the same button or across the two —
+   * can never fire two requests. The server-side conflict guard
+   * (`workflow_runs_one_active_per_lead_key`, surfaced as a ConflictError) is
+   * the real backstop; this only avoids an avoidable extra round trip.
+   */
+  async function handleConfirmRerun() {
+    setRerunning(true)
+    const result = await requestManualRerunAction(run.id)
+    setRerunning(false)
+    setConfirmOpen(false)
+
+    if (!result.ok) {
+      toast.error(result.message)
+      return
+    }
+
+    toast.success('Workflow re-run started')
+    // The rerun is a NEW WorkflowRun — navigate to it, then refresh so the
+    // server-rendered detail (and every cache router.refresh() invalidates,
+    // e.g. the lead's Automation tab) reflects it immediately rather than on
+    // the next natural navigation.
+    router.push(`/automation/runs/${result.runId}`)
+    router.refresh()
+  }
 
   const isFailed = run.status === 'FAILED'
   const isEmailSkipped =
@@ -98,9 +139,7 @@ export function RunDetail({ run, workflowName }: { run: WorkflowRunView; workflo
               <Button variant="outline" onClick={() => setTab('logs')}>
                 View Logs
               </Button>
-              <Button
-                onClick={() => toast.info('Re-running a workflow arrives with the Phase 2 backend')}
-              >
+              <Button onClick={() => setConfirmOpen(true)} disabled={rerunning}>
                 <RotateCcwIcon data-icon="inline-start" />
                 Re-run Workflow
               </Button>
@@ -299,7 +338,8 @@ export function RunDetail({ run, workflowName }: { run: WorkflowRunView; workflo
             {isFailed ? (
               <Button
                 className="mt-4 w-full"
-                onClick={() => toast.info('Re-running a workflow arrives with the Phase 2 backend')}
+                onClick={() => setConfirmOpen(true)}
+                disabled={rerunning}
               >
                 <RotateCcwIcon data-icon="inline-start" />
                 Re-run Workflow
@@ -308,6 +348,26 @@ export function RunDetail({ run, workflowName }: { run: WorkflowRunView; workflo
           </CardContent>
         </Card>
       </div>
+
+      <Dialog open={confirmOpen} onOpenChange={(next) => !rerunning && setConfirmOpen(next)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Re-run this workflow?</DialogTitle>
+            <DialogDescription>
+              This starts a new run for {run.lead.name} from the beginning — Enrich Lead through
+              Notify Team. The failed run stays in history; nothing about it is retried in place.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmOpen(false)} disabled={rerunning}>
+              Cancel
+            </Button>
+            <Button onClick={() => void handleConfirmRerun()} disabled={rerunning}>
+              {rerunning ? 'Re-running…' : 'Re-run Workflow'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

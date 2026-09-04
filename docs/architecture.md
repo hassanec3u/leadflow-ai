@@ -109,7 +109,9 @@ Inbound lead capture (webhook/form/ad-platform) hits an API route, writes the `L
 1. **The application's database role must not be a superuser and must not hold `BYPASSRLS`.** PostgreSQL superusers ignore RLS entirely. This was caught by the Phase 0 test suite: the first run of the isolation tests "passed" tenant queries that should have been blocked, purely because the test connection was the bootstrap superuser. Provision a dedicated role (`GRANT SELECT, INSERT, UPDATE, DELETE`, nothing more) for the app's `DATABASE_URL`.
 2. **`FORCE ROW LEVEL SECURITY`, not just `ENABLE`.** Plain `ENABLE` exempts the table's owner. If the app connects as the role that owns the tables — the default when migrations and the app share a role — `ENABLE` alone would leave policies unenforced. Both are set in the RLS migration, and a test asserts `relforcerowsecurity` is true.
 
-## 5. Data Flow: the 7-step pipeline
+## 5. Data Flow: the pipeline
+
+**Revised after Phase 2:** the original design below numbered 7 steps including "Add to CRM." That step was removed — LeadFlow AI is itself the CRM, so syncing a lead to a separate CRM mid-pipeline duplicated `Lead`, which is already the system of record from ingestion onward. The implemented pipeline (`lib/automation/pipeline.ts`, `PIPELINE_STEPS`) is Ingest + 5 execution steps: Enrich, AI Qualification, Score & Tag, Send Email, Notify Team. Step 5 below ("Add to CRM") is left in place, struck through, as a record of the original design and why it was cut — not as a description of current behavior.
 
 **Deduplication & idempotency (added after architecture review):** ingestion computes a `dedup_key` from the triggering event (e.g., org + source + external id, or org + email for form submits) and upserts `Lead` on `(org_id, email)` rather than always inserting — a repeat submission updates the existing lead and is treated as re-engagement, not a fresh pipeline run, unless the existing lead has no active run. `WorkflowRun.dedup_key` is unique, so a duplicate webhook delivery (a standard at-least-once delivery hazard) cannot start a second concurrent run for the same lead. Every side-effecting step (email send, Slack notify, Airtable upsert) is called with the owning `WorkflowRunStep.id` as an idempotency key where the provider supports one, and otherwise checked against existing records (e.g., "does an `EmailEvent(sent)` already exist for this run?") before executing — a retried step must never re-send a real email or re-create a real Slack message.
 
@@ -117,7 +119,7 @@ Inbound lead capture (webhook/form/ad-platform) hits an API route, writes the `L
 2. **Enrich** — worker calls the configured enrichment provider (**pluggable, vendor TBD**) with lead email/domain, writes `LeadEnrichment`, updates `Lead.status=enriching→enriched`. If no enrichment provider is connected, this step's `WorkflowRunStep.status=skipped` and the pipeline proceeds with unenriched data.
 3. **AI Qualification** — worker calls **OpenAI GPT-4o** (confirmed) with lead + enrichment data using a schema-validated (structured-output) request, writes `AIInsight` (summary, keywords, recommended action), computes `ai_score` clamped to [0,100]. A per-org AI budget check runs before this call; if the org has exceeded its monthly quota, the step is `blocked`, not silently skipped. If the model's response fails schema validation, `ai_score` is left `null` and the lead is flagged for manual review rather than defaulting to a guessed score.
 4. **Score & Tag** — apply org-configurable thresholds to `ai_score` → `Lead.qualification`. Skipped (not applicable) if step 3 left `ai_score` null.
-5. **Add to CRM** — sync the `Lead` to **Airtable** (confirmed CRM integration), **one-way (LeadFlow → Airtable) only** — the Airtable record is a projection for the sales team, not an alternate write path; LeadFlow's own `Lead` row remains the sole system of record. Sync failure does not fail the run (non-blocking), and the upsert is keyed by a stable external id to avoid creating duplicate Airtable records on retry.
+5. ~~**Add to CRM** — sync the `Lead` to Airtable~~ **Removed after Phase 2.** LeadFlow's own `Lead` row created at step 1 already IS the CRM record — there was never a second system of record for this step to sync into. If an optional Airtable projection is ever built, it is a separate, decoupled integration, not a pipeline step (see product-spec.md §10). Kept numbered here, struck through, only so steps 6–7 below and their cross-references elsewhere in this document keep their original numbers.
 6. **Send Email** — generate personalized email via OpenAI (lead-supplied text passed as data, never concatenated into the system/instruction prompt — mitigates prompt injection), send via the configured email provider (**pluggable, vendor TBD**), log `EmailEvent(type=sent)` linked to the triggering `WorkflowRunStep.id`; provider webhooks later log `opened`/`replied`. If no email provider is connected, `WorkflowRun.status=blocked` (see new status below) — sending is core to the product's value, so this is surfaced as blocked, not silently skipped like enrichment.
 7. **Notify Team** — **Slack** (confirmed) message to the lead owner (via `User.slackUserId` if set) or a default channel; in-app `Notification` row created regardless of Slack connectivity (Slack is a delivery channel, not the source of truth).
 
@@ -144,17 +146,18 @@ Each step's `WorkflowRunStep` is what the dashboard's `WorkflowStepper` and `Wor
 
 ## 8. Integration Provider Abstraction
 
-Because two of the five pipeline integrations are unconfirmed (enrichment, email), every provider — confirmed or not — is implemented behind a small interface per capability, not called directly from workflow-step code:
+Because two of the four pipeline integrations are unconfirmed (enrichment, email), every provider — confirmed or not — is implemented behind a small interface per capability, not called directly from workflow-step code:
 
 - `EnrichmentProvider.enrich(domainOrEmail) → EnrichmentResult`
 - `AIQualificationProvider.qualify(lead, enrichment) → { score, summary, keywords, recommendedAction }`
 - `EmailProvider.send(to, subject, body) → EmailSendResult`
 - `NotificationProvider.notify(channel, message) → void`
-- `CrmSyncProvider.upsertLead(lead) → SyncResult`
+
+(`CrmSyncProvider` existed here for the "Add to CRM" step, removed after Phase 2 — see §5. It is not part of the current registry.)
 
 Each `WorkflowStep` calls the interface, not a named vendor SDK. `Integration.provider` selects which concrete implementation is active per org. This means:
 
-- Confirmed vendors (OpenAI for `AIQualificationProvider`, Airtable for `CrmSyncProvider`, Slack for `NotificationProvider`) ship as the default/only implementation initially, without blocking a second implementation being added later.
+- Confirmed vendors (OpenAI for `AIQualificationProvider`, Slack for `NotificationProvider`) ship as the default/only implementation initially, without blocking a second implementation being added later.
 - Unconfirmed slots (`EnrichmentProvider`, `EmailProvider`) can ship v1 with **no implementation connected** (steps skip/block per §5) or with a placeholder implementation, and a real vendor is plugged in once decided — with no change to the pipeline engine, schema, or step-sequencing logic.
 - No workflow step, API route, or DB field should be named after an unconfirmed vendor (e.g., no `clearbitId` column) — use provider-neutral naming (`enrichmentProvider`, `LeadEnrichment.provider`) everywhere.
 
@@ -223,13 +226,13 @@ Rule enforced throughout: business logic lives in `lib/services` and `lib/`, nev
 
 `lib/auth/session.ts` is the Data Access Layer and the only sanctioned way to learn who the caller is:
 
-| Function                                            | Purpose                                    |
-| --------------------------------------------------- | ------------------------------------------ |
-| `getCurrentUser()`                                  | Signed-in user or `null`                   |
-| `requireUser()`                                     | Same, but throws `UnauthenticatedError`    |
-| `getCurrentOrganization()` / `requireOrganization()` | Current tenant                             |
-| `requireRole(...roles)`                             | Assert role membership                     |
-| `requireCapability(capability)`                     | Assert a capability from the RBAC matrix   |
+| Function                                             | Purpose                                  |
+| ---------------------------------------------------- | ---------------------------------------- |
+| `getCurrentUser()`                                   | Signed-in user or `null`                 |
+| `requireUser()`                                      | Same, but throws `UnauthenticatedError`  |
+| `getCurrentOrganization()` / `requireOrganization()` | Current tenant                           |
+| `requireRole(...roles)`                              | Assert role membership                   |
+| `requireCapability(capability)`                      | Assert a capability from the RBAC matrix |
 
 Three properties make this trustworthy, each covered by a test:
 

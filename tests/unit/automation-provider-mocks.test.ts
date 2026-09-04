@@ -10,7 +10,6 @@ import {
 import {
   MockAiBudgetGuard,
   MockAiQualificationProvider,
-  MockCrmSyncProvider,
   MockEmailProvider,
   MockEnrichmentProvider,
   MockNotificationProvider,
@@ -141,28 +140,6 @@ describe('MockAiQualificationProvider', () => {
   })
 })
 
-describe('MockCrmSyncProvider', () => {
-  it('returns a deterministic external record id', async () => {
-    const provider = new MockCrmSyncProvider()
-    const result = await provider.upsertLead({ ...call('step_1'), lead, aiScore: 91 })
-    expect(result.recordId).toBe('mock-crm-step_1')
-  })
-
-  it('records calls, including a null aiScore', async () => {
-    const provider = new MockCrmSyncProvider()
-    await provider.upsertLead({ ...call('step_1'), lead, aiScore: null })
-    expect(provider.calls).toHaveLength(1)
-    expect(provider.calls[0]?.input.aiScore).toBeNull()
-  })
-
-  it('can simulate a provider failure', async () => {
-    const provider = new MockCrmSyncProvider({ shouldFail: true })
-    await expect(
-      provider.upsertLead({ ...call('step_1'), lead, aiScore: 91 }),
-    ).rejects.toBeInstanceOf(ProviderCallError)
-  })
-})
-
 describe('MockEmailProvider', () => {
   it('returns a deterministic providerMessageId and preserves the idempotency key', async () => {
     const provider = new MockEmailProvider()
@@ -255,7 +232,6 @@ describe('provider registry injection', () => {
     setProviderRegistry({
       enrichment: new MockEnrichmentProvider(),
       ai: new MockAiQualificationProvider({ score: 91 }),
-      crm: new MockCrmSyncProvider(),
       email: new MockEmailProvider(),
       notification: new MockNotificationProvider(),
       aiBudget: new MockAiBudgetGuard(),
@@ -264,7 +240,6 @@ describe('provider registry injection', () => {
     const registry = getProviderRegistry()
     expect(registry.enrichment).toBeInstanceOf(MockEnrichmentProvider)
     expect(registry.ai).toBeInstanceOf(MockAiQualificationProvider)
-    expect(registry.crm).toBeInstanceOf(MockCrmSyncProvider)
     expect(registry.email).toBeInstanceOf(MockEmailProvider)
     expect(registry.notification).toBeInstanceOf(MockNotificationProvider)
     expect(registry.aiBudget).toBeInstanceOf(MockAiBudgetGuard)
@@ -279,7 +254,6 @@ describe('provider registry injection', () => {
     expect(registry).toEqual({
       enrichment: null,
       ai: null,
-      crm: null,
       email: null,
       notification: null,
       aiBudget: null,

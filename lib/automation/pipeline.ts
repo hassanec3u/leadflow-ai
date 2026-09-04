@@ -14,12 +14,22 @@ import type { WorkflowStepKind } from '@prisma/client'
 /** AI score at or above this qualifies the lead. Defined ONCE, here. */
 export const QUALIFICATION_THRESHOLD = 70
 
-/** Execution order. Changing this array changes the pipeline. */
+/**
+ * Execution order. Changing this array changes the pipeline.
+ *
+ * `ADD_TO_CRM` was removed (LeadFlow's own `Lead` row is already the system
+ * of record — see docs/product-spec.md §1 and §10 — so syncing it to an
+ * external CRM mid-pipeline was redundant business logic, not a real
+ * requirement). It is deliberately still a member of the `WorkflowStepKind`
+ * DB enum below and of `STEP_MAX_ATTEMPTS`: existing `WorkflowStepRun` rows
+ * from before this change carry that value and must stay readable, and
+ * Postgres has no non-destructive way to drop an enum value that rows still
+ * reference. New runs simply never create a row with that step again.
+ */
 export const PIPELINE_STEPS = [
   'ENRICH',
   'AI_QUALIFY',
   'SCORE_AND_TAG',
-  'ADD_TO_CRM',
   'SEND_EMAIL',
   'NOTIFY_TEAM',
 ] as const satisfies readonly WorkflowStepKind[]
@@ -27,8 +37,7 @@ export const PIPELINE_STEPS = [
 /**
  * A critical step's terminal failure fails the whole run and stops the
  * pipeline. A non-critical step's failure is recorded and execution continues
- * — docs/architecture.md §5 explicitly makes CRM sync non-blocking, and a
- * failed notification must not invalidate work that already succeeded.
+ * — a failed notification must not invalidate work that already succeeded.
  */
 const CRITICAL_STEPS: ReadonlySet<WorkflowStepKind> = new Set<WorkflowStepKind>([
   'ENRICH',
@@ -45,6 +54,11 @@ export function isCriticalStep(step: WorkflowStepKind): boolean {
  * Total provider attempts per step, retries included (1 = no retry).
  * Central, per the Phase 2C brief — the engine reads these and nothing else
  * decides how many times a provider is called.
+ *
+ * `ADD_TO_CRM` keeps an entry only because `WorkflowStepKind` still carries
+ * the value (see the note on `PIPELINE_STEPS` above) and this map is typed
+ * exhaustively over that enum — it is never read, since the step is no
+ * longer in `PIPELINE_STEPS`.
  */
 export const STEP_MAX_ATTEMPTS: Record<WorkflowStepKind, number> = {
   ENRICH: 3,

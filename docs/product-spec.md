@@ -12,8 +12,8 @@ LeadFlow AI is a multi-tenant SaaS "full revenue platform": it captures leads fr
 
 **Confirmed by the reference screenshot** (treat as fixed requirements):
 
-- The 7-step pipeline itself: New Lead → Enrich Data → AI Qualification → Score & Tag → Add to CRM → Send Email → Notify Team.
-- **Airtable** is the CRM integration behind the "Add to CRM" step.
+- The reference screenshot's pipeline: New Lead → Enrich Data → AI Qualification → Score & Tag → Add to CRM → Send Email → Notify Team.
+  **Revised after Phase 2:** the implemented pipeline drops the "Add to CRM" step — LeadFlow AI **is itself the CRM** (its own `Lead` row is the system of record from the moment a lead is captured, not something a downstream step needs to create), so syncing a lead to a separate CRM mid-pipeline was redundant business logic, not a real product requirement. The pipeline is now: Enrich Data → AI Qualification → Score & Tag → Send Email → Notify Team (`lib/automation/pipeline.ts`). Airtable — if ever built — becomes an optional external projection, decoupled from the pipeline (see §10).
 - **Slack** is the team-notification integration behind the "Notify Team" step.
 - **OpenAI GPT-4o** is the AI provider behind the "AI Qualification" step.
 - Dashboard metrics, charts, recent-leads table, and AI insight panel as shown.
@@ -126,15 +126,14 @@ All tenant-owned tables carry `org_id` for isolation (enforced at query layer + 
 
 **Enrollment policy:** only leads captured via **webhook/form/ad source** auto-enroll in this pipeline. Manually entered or CSV-imported leads are created in `status=new` **without** triggering the pipeline (no automated email is sent on their behalf) — a rep must explicitly choose "Run automation" for that lead. This avoids surprising an operator with an automated outbound email for a lead they added as a personal note.
 
-**Primary pipeline** (matches screenshot, async/queued, each step recorded as a `WorkflowRunStep`):
+**Primary pipeline** (async/queued, each step recorded as a `WorkflowRunStep`). The original reference screenshot showed a 7-step sequence including "Add to CRM" — dropped after Phase 2 (see §2): LeadFlow AI is itself the CRM, so a separate CRM-sync step was redundant against `Lead` as the system of record.
 
 1. New Lead — ingested via form/webhook/manual/import
 2. Enrich Data — call to a pluggable enrichment provider (not yet confirmed; mockup shows "Clearbit API" as an illustrative example only), populates company/firmographic data
 3. AI Qualification — **OpenAI GPT-4o** (confirmed) scores intent from enrichment + form/behavioral data
 4. Score & Tag — apply configurable thresholds → Hot/Warm/Cold
-5. Add to CRM — sync the lead to **Airtable** (confirmed CRM integration), **one-way (LeadFlow → Airtable) for MVP**; the Airtable record is a projection, not an alternate write path
-6. Send Email — AI-drafted personalized email via a pluggable email provider (vendor not yet confirmed)
-7. Notify Team — **Slack** message to owner/channel (confirmed)
+5. Send Email — AI-drafted personalized email via a pluggable email provider (vendor not yet confirmed)
+6. Notify Team — **Slack** message to owner/channel (confirmed)
 
 **Secondary workflows:** reply detected → status update → notify owner; manual re-score; lead reassignment; campaign step sequencing/nurture drip for Warm/Cold; failed-step retry with backoff and manual re-run from `/automation/runs`.
 
@@ -159,11 +158,11 @@ All tenant-owned tables carry `org_id` for isolation (enforced at query layer + 
 
 **Confirmed** (named explicitly in the reference screenshot):
 
-| Provider      | Purpose                                 | Direction                                                                                                                                                                                  |
-| ------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| OpenAI GPT-4o | Scoring, summarization, email drafting  | Outbound (API call)                                                                                                                                                                        |
-| Airtable      | CRM record sync ("Add to CRM" step)     | **One-way (LeadFlow → Airtable) for MVP** — see architecture.md §5. Two-way sync (edits in Airtable flowing back) is explicitly out of scope until conflict-resolution rules are designed. |
-| Slack         | Team notifications ("Notify Team" step) | Outbound                                                                                                                                                                                   |
+| Provider      | Purpose                                                            | Direction                                                                                                                                                                                                                 |
+| ------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| OpenAI GPT-4o | Scoring, summarization, email drafting                             | Outbound (API call)                                                                                                                                                                                                       |
+| Airtable      | Optional external CRM projection, **not a pipeline step** — see §2 | **Future/optional, decoupled from the pipeline.** If ever built: one-way (LeadFlow → Airtable), a projection for the sales team, not an alternate write path — LeadFlow's own `Lead` row stays the sole system of record. |
+| Slack         | Team notifications ("Notify Team" step)                            | Outbound                                                                                                                                                                                                                  |
 
 **Not confirmed — implemented as a pluggable provider slot, no vendor hard-dependency:**
 

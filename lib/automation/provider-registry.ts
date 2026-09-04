@@ -18,9 +18,11 @@ import {
  * knows which concrete provider fills which slot.
  *
  * The AI (Phase 2D-2) and enrichment (Phase 2D-4) slots are filled here, each
- * only when its own credential is configured. Email, notification and CRM
- * stay null, so the engine keeps its existing behaviour for them (SKIPPED for
- * the optional ones, BLOCKED for email on a qualified lead).
+ * only when its own credential is configured. Email and notification stay
+ * null, so the engine keeps its existing behaviour for them (SKIPPED for the
+ * optional one, BLOCKED for email on a qualified lead). There is no CRM slot
+ * — `ADD_TO_CRM` was removed from the pipeline (lib/automation/pipeline.ts);
+ * LeadFlow's own `Lead` row is the system of record.
  */
 
 let configured = false

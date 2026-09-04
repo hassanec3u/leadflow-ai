@@ -25,7 +25,15 @@ export { QUALIFICATION_THRESHOLD }
 
 export const AUTOMATION_RUNS_PAGE_SIZE = 8
 
-/** Human labels for the six fixed steps, in `PIPELINE_STEPS` order. */
+/**
+ * Human labels for the five fixed steps, in `PIPELINE_STEPS` order.
+ *
+ * Keeps an `ADD_TO_CRM` entry even though it is no longer in `PIPELINE_STEPS`
+ * (lib/automation/pipeline.ts): this map is typed exhaustively over
+ * `WorkflowStepKind`, which still carries that value for historical
+ * `WorkflowStepRun` rows. `PIPELINE_STEP_VIEWS` below only ever looks up the
+ * five current keys, so this entry is otherwise unused.
+ */
 const STEP_PRESENTATION: Record<WorkflowStepKind, { name: string; detail: string }> = {
   ENRICH: { name: 'Enrich Lead', detail: 'Enrichment' },
   AI_QUALIFY: { name: 'AI Qualification', detail: 'Score & Qualification' },

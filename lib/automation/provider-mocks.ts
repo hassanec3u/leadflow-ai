@@ -17,7 +17,6 @@
 import type {
   AiBudgetGuard,
   AiQualificationProvider,
-  CrmSyncProvider,
   EmailProvider,
   EnrichmentCompany,
   EnrichmentLeadContext,
@@ -190,41 +189,6 @@ export class MockAiQualificationProvider implements AiQualificationProvider {
       recommendedAction: this.recommendedAction,
       model: this.name,
     }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// CRM sync
-// ---------------------------------------------------------------------------
-
-export type MockCrmSyncProviderOptions = { shouldFail?: boolean }
-
-export class MockCrmSyncProvider implements CrmSyncProvider {
-  readonly name = 'mock-crm'
-  readonly calls: RecordedCall<{ lead: LeadFacts; aiScore: number | null }>[] = []
-  private readonly shouldFail: boolean
-  private counter = 0
-
-  constructor(options: MockCrmSyncProviderOptions = {}) {
-    this.shouldFail = options.shouldFail ?? false
-  }
-
-  async upsertLead(
-    input: ProviderCall & { lead: LeadFacts; aiScore: number | null },
-  ): Promise<{ recordId: string }> {
-    this.calls.push({
-      idempotencyKey: input.idempotencyKey,
-      organizationId: input.organizationId,
-      input: { lead: input.lead, aiScore: input.aiScore },
-    })
-
-    if (this.shouldFail) {
-      throw new ProviderCallError('mock_crm_failed', 'Mock CRM provider failure')
-    }
-    this.counter += 1
-    // Deterministic and idempotency-key-derived so retries of the SAME step
-    // resolve to the SAME external record instead of creating duplicates.
-    return { recordId: `mock-crm-${input.idempotencyKey}` }
   }
 }
 

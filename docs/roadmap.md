@@ -27,10 +27,10 @@ Implemented 2026-09-01. As-built detail in `docs/architecture.md` §11; status a
 
 - Job queue integration: **Inngest** (decided — see `docs/architecture.md` §3.2)
 - Multi-tenant foundation for this phase: `org_id` denormalized on every tenant table + Postgres RLS enabled (architecture.md §4) — **not deferred**, since this phase is where cross-tenant leakage would first become possible.
-- Single auto-provisioned `Workflow`/`WorkflowStep` (fixed 7-step definition, not a builder — architecture.md §10) + `WorkflowRun`/`WorkflowRunStep` schema, including the `blocked` status and `dedup_key` uniqueness (architecture.md §5).
+- Single auto-provisioned `Workflow`/`WorkflowStep` (fixed pipeline definition, not a builder — architecture.md §10) + `WorkflowRun`/`WorkflowRunStep` schema, including the `blocked` status and `dedup_key` uniqueness (architecture.md §5). Originally 7 steps including "Add to CRM"; that step was later removed (architecture.md §5) since LeadFlow's own `Lead` row is already the system of record — the shipped pipeline is Ingest + 5 execution steps.
 - Inbound webhook + form capture → upsert-on-`(org_id, email)` → enqueue run, with idempotency keys on every side-effecting step call.
 - `/automation/runs` execution history view, retry action.
-- Ship with steps 1, 5 (add to CRM), 7 (notify — in-app only) working end-to-end before AI/enrichment are real, using stub/mock providers — validates the async architecture independent of AI quality.
+- Ship with Ingest and Notify (in-app only) working end-to-end before AI/enrichment are real, using stub/mock providers — validates the async architecture independent of AI quality. (Originally also listed the now-removed "Add to CRM" step here.)
 - Rate limiting on the public lead-capture endpoint ships in this phase, not deferred to Phase 8 — it's a day-one abuse/cost vector once the endpoint is live.
 
 ## Phase 3 — Enrichment Slot & AI Qualification

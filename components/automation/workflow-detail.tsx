@@ -1,11 +1,21 @@
 'use client'
 
+import { useState } from 'react'
 import Link from 'next/link'
-import { ArrowLeftIcon, MoreHorizontalIcon, PauseIcon } from 'lucide-react'
+import { useRouter } from 'next/navigation'
+import { ArrowLeftIcon, MoreHorizontalIcon, PauseIcon, PlayIcon } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -28,13 +38,15 @@ import {
   type WorkflowRunView,
   type WorkflowSummaryView,
 } from '@/lib/automation/view-model'
+import { pauseWorkflowAction, resumeWorkflowAction } from '@/app/(app)/automation/actions'
 
 /**
  * Detail view of the single fixed pipeline.
  *
  * The step list is the fixed MVP pipeline — there is no builder, no reordering
- * and no step creation (docs/architecture.md §10). Pause and the overflow
- * actions are visual only in this phase.
+ * and no step creation (docs/architecture.md §10). Pause/Resume calls the real
+ * workflow status service; the overflow actions (Duplicate, Export) remain
+ * visual only in this phase — out of scope for this micro-phase.
  */
 
 /** Live state of each pipeline step, mirroring the workflow's current run. */
@@ -51,6 +63,36 @@ export function WorkflowDetail({
   workflow: WorkflowSummaryView
   recentRuns: WorkflowRunView[]
 }) {
+  const router = useRouter()
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [pending, setPending] = useState(false)
+
+  const isPaused = workflow.status === 'PAUSED'
+
+  /**
+   * One shared handler for the single toggle: `pending` disables both the
+   * trigger button and the dialog's confirm button at once, so a double
+   * click — before or during confirmation — can never fire two requests. The
+   * server-side conditional update is the real backstop (see
+   * lib/services/automation-workflow-status.ts); this only avoids an
+   * avoidable extra round trip.
+   */
+  async function handleConfirmToggle() {
+    setPending(true)
+    const action = isPaused ? resumeWorkflowAction : pauseWorkflowAction
+    const result = await action(workflow.id)
+    setPending(false)
+    setConfirmOpen(false)
+
+    if (!result.ok) {
+      toast.error(result.message)
+      return
+    }
+
+    toast.success(isPaused ? 'Workflow resumed' : 'Workflow paused')
+    router.refresh()
+  }
+
   function notImplemented() {
     toast.info('Workflow controls arrive with the Phase 2 backend')
   }
@@ -77,9 +119,18 @@ export function WorkflowDetail({
             <p className="text-muted-foreground mt-1 text-sm">{workflow.description}</p>
           </div>
           <div className="flex items-center gap-2">
-            <Button variant="outline" onClick={notImplemented}>
-              <PauseIcon data-icon="inline-start" />
-              Pause
+            <Button variant="outline" onClick={() => setConfirmOpen(true)} disabled={pending}>
+              {isPaused ? (
+                <>
+                  <PlayIcon data-icon="inline-start" />
+                  Resume
+                </>
+              ) : (
+                <>
+                  <PauseIcon data-icon="inline-start" />
+                  Pause
+                </>
+              )}
             </Button>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -278,6 +329,27 @@ export function WorkflowDetail({
           </Card>
         </TabsContent>
       </Tabs>
+
+      <Dialog open={confirmOpen} onOpenChange={(next) => !pending && setConfirmOpen(next)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{isPaused ? 'Resume this workflow?' : 'Pause this workflow?'}</DialogTitle>
+            <DialogDescription>
+              {isPaused
+                ? 'New Website Form leads will start enrolling automatically again. Runs already in progress were never affected while paused.'
+                : 'No new lead will enroll automatically while paused. Runs already in progress keep going until they finish.'}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmOpen(false)} disabled={pending}>
+              Cancel
+            </Button>
+            <Button onClick={() => void handleConfirmToggle()} disabled={pending}>
+              {pending ? 'Saving…' : isPaused ? 'Resume Workflow' : 'Pause Workflow'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

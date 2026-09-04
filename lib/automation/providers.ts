@@ -176,13 +176,6 @@ export interface AiQualificationProvider {
   ): Promise<unknown>
 }
 
-export interface CrmSyncProvider {
-  readonly name: string
-  upsertLead(input: ProviderCall & { lead: LeadFacts; aiScore: number | null }): Promise<{
-    recordId: string
-  }>
-}
-
 export interface EmailProvider {
   readonly name: string
   send(
@@ -216,7 +209,6 @@ export interface AiBudgetGuard {
 export type ProviderRegistry = {
   enrichment: EnrichmentProvider | null
   ai: AiQualificationProvider | null
-  crm: CrmSyncProvider | null
   email: EmailProvider | null
   notification: NotificationProvider | null
   aiBudget: AiBudgetGuard | null
@@ -226,7 +218,6 @@ export type ProviderRegistry = {
 export const EMPTY_PROVIDER_REGISTRY: ProviderRegistry = {
   enrichment: null,
   ai: null,
-  crm: null,
   email: null,
   notification: null,
   aiBudget: null,

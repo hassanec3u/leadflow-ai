@@ -1,0 +1,73 @@
+import 'server-only'
+
+import type { WorkflowStatus } from '@prisma/client'
+
+import { requireCapability } from '@/lib/auth/session'
+import { withTenant } from '@/lib/db/tenant'
+import { NotFoundError } from '@/lib/errors'
+
+/**
+ * Pause / Resume the organization's single workflow (Pause/Resume micro-phase).
+ *
+ * `Workflow.status` (`ACTIVE` | `PAUSED`) and its meaning already exist and are
+ * already enforced — this module adds no new business rule:
+ *  - `enrollLeadIfEligible` (lib/services/automation-enrollment.ts) refuses a
+ *    new AUTOMATIC enrollment whenever `workflow.status !== 'ACTIVE'`, so
+ *    setting PAUSED here is what blocks the next capture from enrolling —
+ *    nothing about capture itself changes.
+ *  - Nothing in the execution engine (lib/automation/engine.ts) or the run
+ *    persistence layer (lib/services/workflow-runs.ts) reads `Workflow.status`
+ *    at all, so a run already PENDING/RUNNING is completely unaffected by
+ *    this transition — there is no code path left to add that would stop it.
+ *
+ * This module is therefore only the write path: resolve the caller from the
+ * session (never a client-supplied organization), enforce `automation:manage`
+ * (ADMIN + MANAGER), and flip the one column under `withTenant()`/RLS.
+ */
+
+export type WorkflowStatusResult = { id: string; status: WorkflowStatus }
+
+/**
+ * Conditional transition, same idiom as `claimRun`/`finalizeRun`
+ * (lib/services/workflow-runs.ts): the `updateMany` is keyed on the expected
+ * SOURCE status, never a read-then-write, so two concurrent toggles can never
+ * race past each other into a lost update.
+ *
+ * Idempotent by design: if the workflow is already in `target` — a duplicate
+ * click, or a concurrent toggle that got there first — the conditional update
+ * matches zero rows and the fallback read reports that same state back as
+ * success, never a conflict. There is no "wrong" state to error on; the only
+ * failure is the workflow not existing in this tenant at all.
+ */
+async function setWorkflowStatus(
+  workflowId: string,
+  target: WorkflowStatus,
+): Promise<WorkflowStatusResult> {
+  const user = await requireCapability('automation:manage')
+  const source: WorkflowStatus = target === 'PAUSED' ? 'ACTIVE' : 'PAUSED'
+
+  return withTenant(user.organizationId, async (tx) => {
+    const updated = await tx.workflow.updateMany({
+      where: { id: workflowId, status: source },
+      data: { status: target },
+    })
+    if (updated.count === 1) {
+      return { id: workflowId, status: target }
+    }
+
+    const current = await tx.workflow.findFirst({
+      where: { id: workflowId },
+      select: { id: true, status: true },
+    })
+    if (!current) throw new NotFoundError('Workflow not found.')
+    return { id: current.id, status: current.status }
+  })
+}
+
+export function pauseWorkflowForCurrentUser(workflowId: string): Promise<WorkflowStatusResult> {
+  return setWorkflowStatus(workflowId, 'PAUSED')
+}
+
+export function resumeWorkflowForCurrentUser(workflowId: string): Promise<WorkflowStatusResult> {
+  return setWorkflowStatus(workflowId, 'ACTIVE')
+}

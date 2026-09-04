@@ -85,12 +85,20 @@ const RUN_WITH_LEAD_SELECT = {
 type RunWithLead = Prisma.WorkflowRunGetPayload<{ select: typeof RUN_WITH_LEAD_SELECT }>
 
 /**
- * Build the six fixed step rows for a run.
+ * Build the five fixed step rows for a run.
  *
- * Always six, in `PIPELINE_STEPS` order, whether or not the engine has reached
- * them: a step with no row yet is PENDING, which is what "not started" means.
- * Statuses are passed through untouched — SKIPPED stays SKIPPED, BLOCKED stays
- * BLOCKED.
+ * Always five, in `PIPELINE_STEPS` order, whether or not the engine has
+ * reached them: a step with no row yet is PENDING, which is what "not
+ * started" means. Statuses are passed through untouched — SKIPPED stays
+ * SKIPPED, BLOCKED stays BLOCKED.
+ *
+ * A run created before ADD_TO_CRM was removed from the pipeline may still
+ * carry an `ADD_TO_CRM` `WorkflowStepRun` row in the database — nothing
+ * deletes it — but it is not one of the five keys `PIPELINE_STEP_VIEWS`
+ * iterates, so it does not appear here. That row stays intact and queryable
+ * directly; it is simply outside what this fixed, current-pipeline view
+ * renders. Every OTHER field on such a run (status, the five current steps,
+ * AI output, logs) is unaffected — see tests/unit/automation-read.test.ts.
  */
 /**
  * Re-read the persisted AI output through the SAME validation boundary the

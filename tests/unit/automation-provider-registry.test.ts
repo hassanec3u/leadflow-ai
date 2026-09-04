@@ -50,7 +50,6 @@ describe('ensureProviderRegistry', () => {
     expect(registry).toEqual({
       enrichment: null,
       ai: null,
-      crm: null,
       email: null,
       notification: null,
       aiBudget: null,
@@ -84,7 +83,6 @@ describe('ensureProviderRegistry', () => {
     // AI qualification runs.
     expect(registry.ai?.name).toBe('openai')
     expect(registry.enrichment).toBeNull()
-    expect(registry.crm).toBeNull()
     expect(registry.email).toBeNull()
     expect(registry.notification).toBeNull()
   })
