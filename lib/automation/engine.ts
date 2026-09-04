@@ -8,6 +8,7 @@ import {
   claimStep,
   completeStep,
   finalizeRun,
+  isNotifyTeamEnabled,
   loadLeadFacts,
   loadRunForExecution,
   pinQualificationConfigForRun,
@@ -460,6 +461,11 @@ async function performStep(
     }
 
     case 'NOTIFY_TEAM': {
+      // The switch is checked BEFORE the provider: "switched off" is the
+      // operator's decision and outranks whatever happens to be connected.
+      if (!(await isNotifyTeamEnabled(run.workflowId))) {
+        return { status: 'SKIPPED', errorCode: STEP_REASON.stepDisabled }
+      }
       if (!providers.notification) {
         return { status: 'SKIPPED', errorCode: STEP_REASON.providerNotConfigured }
       }

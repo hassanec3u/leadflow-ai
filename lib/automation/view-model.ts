@@ -153,6 +153,8 @@ export type WorkflowSummaryView = {
   name: string
   description: string
   status: WorkflowStatusView
+  /** Whether the NOTIFY_TEAM step is switched on (Workflow.notifyTeamEnabled). */
+  notifyTeamEnabled: boolean
   trigger: string
   version: string
   runsWindowLabel: string

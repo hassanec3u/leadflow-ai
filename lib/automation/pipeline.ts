@@ -101,6 +101,14 @@ export const STEP_REASON = {
   emailProviderNotConfigured: 'email_provider_not_configured',
   aiProviderNotConfigured: 'ai_provider_not_configured',
   belowThreshold: 'below_threshold',
+  /**
+   * An operator switched this step off (Workflow.notifyTeamEnabled).
+   *
+   * Deliberately distinct from `providerNotConfigured`: "I chose not to run
+   * this" and "nothing is connected to run it" are different situations, and a
+   * run has to stay able to tell them apart afterwards.
+   */
+  stepDisabled: 'step_disabled',
   upstreamFailed: 'upstream_failed',
   upstreamBlocked: 'upstream_blocked',
   missingAiResult: 'missing_ai_result',

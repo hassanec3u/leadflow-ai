@@ -129,8 +129,8 @@ Access is scoped in application code only — see architecture.md §4.
 2. Enrich Data — call to a pluggable enrichment provider (not yet confirmed; mockup shows "Clearbit API" as an illustrative example only), populates company/firmographic data
 3. AI Qualification — **OpenAI GPT-4o** (confirmed) scores intent from enrichment + form/behavioral data
 4. Score & Tag — apply configurable thresholds → Hot/Warm/Cold
-5. Send Email — AI-drafted personalized email via a pluggable email provider (vendor not yet confirmed)
-6. Notify Team — **Slack** message to owner/channel (confirmed)
+5. Send Email — acknowledgement to the prospect via Resend (decided 2026-09-04). Currently a fixed template quoting the prospect's own form message; AI drafting is deferred (see docs/roadmap.md Phase 4)
+6. Notify Team — **Slack** message to owner/channel (confirmed; not yet implemented). Switchable on/off per deployment via the Pipeline screen — the only step with a switch
 
 **Secondary workflows:** reply detected → status update → notify owner; manual re-score; lead reassignment; campaign step sequencing/nurture drip for Warm/Cold; failed-step retry with backoff and manual re-run from `/automation/runs`.
 
@@ -166,7 +166,7 @@ Access is scoped in application code only — see architecture.md §4.
 | Provider slot          | Purpose                                        | Notes                                                                                                                      |
 | ---------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | Enrichment provider    | Firmographic enrichment ("Enrich Data" step)   | Mockup shows "Clearbit API" as an example only; not a confirmed requirement. Build against a generic enrichment interface. |
-| Email-sending provider | Send + track opens/replies ("Send Email" step) | Mockup labels this step only "Personalized Email," no vendor shown. Build against a generic email-sending interface.       |
+| Resend | Send the outreach acknowledgement ("Send Email" step) | **Decided 2026-09-04.** Reached through the generic `EmailProvider` interface, so it stays swappable. |
 
 **Lead capture sources** (implied by the "Source" column in the Recent Leads table): Website Form, Webhook, LinkedIn, Google Ads, Referral, manual/CSV — these are data-source labels, not necessarily third-party API integrations, and don't require a live LinkedIn/Google Ads connection to implement.
 

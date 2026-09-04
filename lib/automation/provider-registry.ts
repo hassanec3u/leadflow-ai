@@ -3,6 +3,7 @@ import 'server-only'
 import { createApolloEnrichmentProvider } from '@/lib/automation/apollo-enrichment-provider'
 import { createOpenAiQualificationProvider } from '@/lib/automation/openai-qualification-provider'
 import { createProspeoEnrichmentProvider } from '@/lib/automation/prospeo-enrichment-provider'
+import { createResendEmailProvider } from '@/lib/automation/resend-email-provider'
 import {
   getProviderRegistry,
   setProviderRegistry,
@@ -17,12 +18,12 @@ import {
  * back into it would create an import cycle. This is the one place that
  * knows which concrete provider fills which slot.
  *
- * The AI (Phase 2D-2) and enrichment (Phase 2D-4) slots are filled here, each
- * only when its own credential is configured. Email and notification stay
- * null, so the engine keeps its existing behaviour for them (SKIPPED for the
- * optional one, BLOCKED for email on a qualified lead). There is no CRM slot
- * — `ADD_TO_CRM` was removed from the pipeline (lib/automation/pipeline.ts);
- * LeadFlow's own `Lead` row is the system of record.
+ * The AI (Phase 2D-2), enrichment (Phase 2D-4) and email (Phase 4) slots are
+ * filled here, each only when its own credential is configured. Notification
+ * stays null — no vendor is implemented for it yet — so the engine keeps
+ * SKIPping that step. There is no CRM slot: `ADD_TO_CRM` was removed from the
+ * pipeline (lib/automation/pipeline.ts); LeadFlow's own `Lead` row is the
+ * system of record.
  */
 
 let configured = false
@@ -38,8 +39,8 @@ let configured = false
 export function ensureProviderRegistry(): ProviderRegistry {
   if (!configured) {
     // Each factory returns null when its credential is absent, leaving that
-    // slot null: AI_QUALIFY then BLOCKs and ENRICH is SKIPped, exactly as
-    // they behave today for local development without keys.
+    // slot null: AI_QUALIFY and SEND_EMAIL then BLOCK and ENRICH is SKIPped,
+    // exactly as they behave today for local development without keys.
     //
     // The registry has ONE enrichment slot and two available vendors, so the
     // precedence is fixed and decided here, at wiring time: Prospeo when its
@@ -49,6 +50,7 @@ export function ensureProviderRegistry(): ProviderRegistry {
     setProviderRegistry({
       ai: createOpenAiQualificationProvider(),
       enrichment: createProspeoEnrichmentProvider() ?? createApolloEnrichmentProvider(),
+      email: createResendEmailProvider(),
     })
     configured = true
   }

@@ -43,7 +43,7 @@ function windowStart(days: number, now: Date): Date {
 async function findWorkflow(db: Pick<typeof prisma, 'workflow'>) {
   return db.workflow.findFirst({
     where: { type: 'LEAD_QUALIFICATION' },
-    select: { id: true, status: true, version: true, createdAt: true },
+    select: { id: true, status: true, version: true, createdAt: true, notifyTeamEnabled: true },
   })
 }
 
@@ -292,6 +292,7 @@ export async function getAutomationOverview(now: Date = new Date()): Promise<Aut
         name: 'AI Lead Qualification Pipeline',
         description: 'Automatically qualify new leads and engage sales.',
         status: workflow.status,
+        notifyTeamEnabled: workflow.notifyTeamEnabled,
         trigger: 'Website Form',
         version: `v${workflow.version}`,
         runsWindowLabel: String(runsInWindow),

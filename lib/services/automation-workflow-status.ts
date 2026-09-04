@@ -72,3 +72,42 @@ export function pauseWorkflowForCurrentUser(workflowId: string): Promise<Workflo
 export function resumeWorkflowForCurrentUser(workflowId: string): Promise<WorkflowStatusResult> {
   return setWorkflowStatus(workflowId, 'ACTIVE')
 }
+
+export type NotifyTeamResult = { id: string; notifyTeamEnabled: boolean }
+
+/**
+ * Switch the NOTIFY_TEAM step on or off.
+ *
+ * Deliberately separate from `status`: pausing stops the pipeline enrolling
+ * anything, while this turns off one optional step and leaves the rest
+ * running. The engine reads the flag at step time
+ * (`isNotifyTeamEnabled` in lib/services/workflow-runs.ts), so a change takes
+ * effect on runs already in flight that have not reached the step yet.
+ *
+ * Same conditional-update idiom, and the same idempotence, as
+ * `setWorkflowStatus` above: setting it to the value it already holds is a
+ * success reporting that state, not a conflict.
+ */
+export async function setNotifyTeamEnabledForCurrentUser(
+  workflowId: string,
+  enabled: boolean,
+): Promise<NotifyTeamResult> {
+  await requireCapability('automation:manage')
+
+  return prisma.$transaction(async (tx) => {
+    const updated = await tx.workflow.updateMany({
+      where: { id: workflowId, notifyTeamEnabled: !enabled },
+      data: { notifyTeamEnabled: enabled },
+    })
+    if (updated.count === 1) {
+      return { id: workflowId, notifyTeamEnabled: enabled }
+    }
+
+    const current = await tx.workflow.findFirst({
+      where: { id: workflowId },
+      select: { id: true, notifyTeamEnabled: true },
+    })
+    if (!current) throw new NotFoundError('Workflow not found.')
+    return { id: current.id, notifyTeamEnabled: current.notifyTeamEnabled }
+  })
+}

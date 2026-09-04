@@ -45,8 +45,8 @@ Implemented 2026-09-01. As-built detail in `docs/architecture.md` §11; status a
 
 ## Phase 4 — Outreach & Campaigns
 
-- `EmailProvider` interface (step 6) — vendor unconfirmed; decision needed before this phase starts (unlike enrichment, this step blocks the pipeline if unset, so it can't ship indefinitely without a vendor)
-- AI-drafted personalized email (step 6)
+- [x] `EmailProvider` — **vendor decided: Resend** (2026-09-04). Sends an acknowledgement to the prospect who submitted the form; deliberately contains no AI-generated text (see below)
+- AI-drafted personalized email (step 6) — **NOT built, deliberately.** The qualification `summary` is an internal explanation of the score ("company unverified, authority in doubt") and must never be mailed to the prospect. A dedicated prospect-facing drafting call is a separate task; the shipped template uses only the lead's own words
 - `/campaigns` list + `/campaigns/:id` builder (fixed sequence, no visual builder yet)
 - Reply-detected → status update workflow
 

@@ -91,6 +91,18 @@ const serverEnvSchema = z.object({
   AIRTABLE_API_KEY: z.string().min(1).optional(),
   SLACK_BOT_TOKEN: z.string().min(1).optional(),
   EMAIL_PROVIDER_API_KEY: z.string().min(1).optional(),
+
+  /**
+   * Resend, for the outreach email sent to a qualified prospect (Phase 4).
+   *
+   * Both are required together: a key with no verified sender address cannot
+   * send anything, so the provider treats either one missing as "not
+   * connected" rather than failing at send time (see
+   * lib/automation/resend-email-provider.ts).
+   */
+  RESEND_API_KEY: z.string().min(1).optional(),
+  /** `From` header. Accepts Resend's `Name <address@domain>` form. */
+  EMAIL_FROM_ADDRESS: z.string().min(1).optional(),
 })
 
 export type ServerEnv = z.infer<typeof serverEnvSchema>

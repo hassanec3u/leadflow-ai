@@ -205,14 +205,25 @@ enum WorkflowStatus {
 /// The single fixed pipeline, auto-provisioned rather than user-created
 /// (docs/architecture.md §10).
 model Workflow {
-  id        String         @id @default(cuid())
-  type      WorkflowType
-  status    WorkflowStatus @default(ACTIVE)
+  id                String         @id @default(cuid())
+  type              WorkflowType
+  status            WorkflowStatus @default(ACTIVE)
+  /// Whether the NOTIFY_TEAM step runs at all.
+  ///
+  /// Distinct from `status`: PAUSED stops the whole pipeline from enrolling
+  /// new leads, whereas this turns off one optional step while the rest keeps
+  /// running. Only NOTIFY_TEAM is switchable — the other four steps either
+  /// carry the pipeline's whole purpose (AI_QUALIFY, SCORE_AND_TAG) or already
+  /// self-disable when their provider is absent (ENRICH, SEND_EMAIL).
+  ///
+  /// Defaults to true so existing behaviour is unchanged: with no notification
+  /// provider configured the step is SKIPped anyway, exactly as before.
+  notifyTeamEnabled Boolean        @default(true)
   /// Copied onto each WorkflowRun at creation time, so a run always records
   /// which pipeline definition it executed even if `version` is bumped later.
-  version   Int            @default(1)
-  createdAt DateTime       @default(now())
-  updatedAt DateTime       @updatedAt
+  version           Int            @default(1)
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
 
   enrollments WorkflowEnrollment[]
   runs        WorkflowRun[]

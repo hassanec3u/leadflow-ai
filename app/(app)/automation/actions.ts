@@ -5,6 +5,8 @@ import { logger } from '@/lib/logger'
 import {
   pauseWorkflowForCurrentUser,
   resumeWorkflowForCurrentUser,
+  setNotifyTeamEnabledForCurrentUser,
+  type NotifyTeamResult,
   type WorkflowStatusResult,
 } from '@/lib/services/automation-workflow-status'
 
@@ -43,6 +45,28 @@ export async function resumeWorkflowAction(
       return { ok: false, message: error.message }
     }
     logger.error('Unexpected resumeWorkflow failure', { error, workflowId })
+    return { ok: false, message: GENERIC_ERROR_MESSAGE }
+  }
+}
+
+export type SetNotifyTeamActionResult =
+  { ok: true; data: NotifyTeamResult } | { ok: false; message: string }
+
+/**
+ * Switches the NOTIFY_TEAM step on or off. Same thin shape as the pause
+ * actions above — the service owns authorisation and the transition.
+ */
+export async function setNotifyTeamEnabledAction(
+  workflowId: string,
+  enabled: boolean,
+): Promise<SetNotifyTeamActionResult> {
+  try {
+    return { ok: true, data: await setNotifyTeamEnabledForCurrentUser(workflowId, enabled) }
+  } catch (error) {
+    if (isAppError(error)) {
+      return { ok: false, message: error.message }
+    }
+    logger.error('Unexpected setNotifyTeamEnabled failure', { error, workflowId, enabled })
     return { ok: false, message: GENERIC_ERROR_MESSAGE }
   }
 }

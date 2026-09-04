@@ -185,6 +185,26 @@ export async function finalizeRun(
   })
 }
 
+/**
+ * Whether the NOTIFY_TEAM step is switched on for this workflow.
+ *
+ * Read at step time rather than pinned onto the run at creation, so switching
+ * notifications off takes effect on work already in flight — which is the
+ * point of the switch. That does not make a replay non-deterministic: a step
+ * that already reached a terminal state is memoized by `claimStep` and never
+ * re-evaluated, so only a step that has not run yet can see a changed value.
+ *
+ * A missing workflow returns false: no workflow means nothing legitimately
+ * asked for this notification.
+ */
+export async function isNotifyTeamEnabled(workflowId: string): Promise<boolean> {
+  const workflow = await prisma.workflow.findFirst({
+    where: { id: workflowId },
+    select: { notifyTeamEnabled: true },
+  })
+  return workflow?.notifyTeamEnabled ?? false
+}
+
 export async function loadLeadFacts(leadId: string): Promise<LeadFacts | null> {
   const lead = await prisma.lead.findFirst({
     where: { id: leadId },

@@ -30,6 +30,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { RunStatusBadge, WorkflowStatusBadge } from '@/components/automation/automation-ui'
 import {
@@ -38,7 +39,11 @@ import {
   type WorkflowRunView,
   type WorkflowSummaryView,
 } from '@/lib/automation/view-model'
-import { pauseWorkflowAction, resumeWorkflowAction } from '@/app/(app)/automation/actions'
+import {
+  pauseWorkflowAction,
+  resumeWorkflowAction,
+  setNotifyTeamEnabledAction,
+} from '@/app/(app)/automation/actions'
 
 /**
  * Detail view of the single fixed pipeline.
@@ -66,6 +71,8 @@ export function WorkflowDetail({
   const router = useRouter()
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [pending, setPending] = useState(false)
+  const [notifyPending, setNotifyPending] = useState(false)
+  const [notifyEnabled, setNotifyEnabled] = useState(workflow.notifyTeamEnabled)
 
   const isPaused = workflow.status === 'PAUSED'
 
@@ -90,6 +97,34 @@ export function WorkflowDetail({
     }
 
     toast.success(isPaused ? 'Workflow resumed' : 'Workflow paused')
+    router.refresh()
+  }
+
+  /**
+   * The Notify Team switch.
+   *
+   * Optimistic: the switch moves immediately and is reverted if the server
+   * refuses, because a control that lags a round trip feels broken. The
+   * server's conditional update remains the authority — `router.refresh()`
+   * re-reads the persisted value either way.
+   */
+  async function handleNotifyToggle(next: boolean) {
+    setNotifyPending(true)
+    setNotifyEnabled(next)
+
+    const result = await setNotifyTeamEnabledAction(workflow.id, next)
+    setNotifyPending(false)
+
+    if (!result.ok) {
+      setNotifyEnabled(!next)
+      toast.error(result.message)
+      return
+    }
+
+    // Trust the server's value, not the requested one: a concurrent toggle
+    // elsewhere may have already put it somewhere else.
+    setNotifyEnabled(result.data.notifyTeamEnabled)
+    toast.success(result.data.notifyTeamEnabled ? 'Team notifications on' : 'Team notifications off')
     router.refresh()
   }
 
@@ -187,6 +222,26 @@ export function WorkflowDetail({
                             <p className="text-foreground text-sm font-medium">{step.name}</p>
                             <p className="text-muted-foreground text-xs">{step.detail}</p>
                           </div>
+                          {step.key === 'NOTIFY_TEAM' ? (
+                            <div className="flex items-center gap-2">
+                              {/*
+                                Visual state only. The switch's own checked
+                                state already conveys on/off to assistive
+                                tech, so this text is aria-hidden rather than
+                                becoming the control's name — the name has to
+                                say WHAT is being switched, not its value.
+                              */}
+                              <span className="text-muted-foreground text-xs" aria-hidden>
+                                {notifyEnabled ? 'Enabled' : 'Disabled'}
+                              </span>
+                              <Switch
+                                checked={notifyEnabled}
+                                disabled={notifyPending}
+                                onCheckedChange={handleNotifyToggle}
+                                aria-label="Notify Team step"
+                              />
+                            </div>
+                          ) : null}
                         </div>
                       </li>
                     )

@@ -88,6 +88,20 @@ Phase 1.1 — Lead business-rules closure is implemented: ownership is now optio
 
 ## Log
 
+- **2026-09-04** — **Send Email (Resend) + a switch for Notify Team.**
+
+  **Send Email (step 4).** `lib/automation/resend-email-provider.ts` fills the `EmailProvider` slot that had been empty since Phase 2C, following the same shape as the Apollo/Prospeo/OpenAI providers (injected client, factory returning null when unconfigured). Vendor decided: **Resend**. `RESEND_API_KEY` and `EMAIL_FROM_ADDRESS` are required together — a key with no verified sender cannot send, so either one missing means "not connected" and the step stays BLOCKED exactly as before.
+
+  **A design flaw caught before any code was written, worth recording.** The agreed plan was to personalise the email using the AI `summary` already on hand. That field is the model's explanation of the SCORE, written for the sales team: on a real run it read *"role/seniority not provided, company details not verified… reducing confidence in fit and authority"*, and the qualification prompt is instructed to note attempted prompt-injection there too. Mailing it to the prospect would have leaked internal scoring rationale. The provider now ignores `summary` entirely and a test asserts it never reaches the payload. The shipped template uses only safe facts: first name, plus the prospect's own form message quoted back to them. `formMessage` is deliberately kept out of the SUBJECT (a newline in a header is how header injection works), and the body is plain text so there is no HTML to escape wrongly.
+
+  **Notify Team switch (step 5).** New `Workflow.notifyTeamEnabled` column (migration `20260904000000_notify_team_toggle`), a switch on Automation → Pipeline gated by `automation:manage`, and a new `step_disabled` skip reason kept distinct from `provider_not_configured` — "I switched it off" and "nothing is connected" are different situations, and a run must stay able to tell them apart. Only NOTIFY_TEAM is switchable: the other four steps either carry the pipeline's whole purpose (AI_QUALIFY, SCORE_AND_TAG) or already self-disable when their provider is absent (ENRICH, SEND_EMAIL). The engine reads the flag at step time, so switching it off affects runs already in flight that have not reached the step; a step that already ran is memoized and unaffected.
+
+  **Two traps hit on the way**, recorded so they are not re-hit: (1) `prisma migrate dev` cannot run against this database — `leadflow_app` is deliberately non-superuser and cannot create Prisma's shadow database — so the migration was produced with `migrate diff --from-config-datasource` plus `migrate deploy`, the same route `0_init` took; (2) that diff proposed DROPPING `workflow_runs_status_createdAt_idx`, the hand-written recovery-sweep index Prisma cannot see in the schema. It is not drift; the DROP was discarded and the migration file explains why.
+
+  **Verification:** `npm run verify` green — 554 tests passing, 0 failing. The migration was applied to the real local database and the three hand-written indexes confirmed intact afterwards. NOT verified: an actual send through Resend, which needs a verified sending domain and a live API key.
+
+  **Explicitly not built:** `/campaigns`, reply detection, AI email drafting, and any Slack implementation.
+
 - **2026-09-04** — **Multi-tenancy removed. The product is now single-tenant** (one company per deployment), a deliberate product decision. `docs/architecture.md` §4 records the full inventory; the shape of it:
 
   - **Schema**: `Organization` dropped; `organizationId` dropped from `User`, `Lead`, `Workflow`, `WorkflowEnrollment`, `WorkflowRun`, `QualificationConfigVersion`. The composite uniques collapsed and each changed meaning — `Lead.email` is globally unique, exactly one `Workflow` row per type, one global `QualificationConfigVersion.version` sequence.

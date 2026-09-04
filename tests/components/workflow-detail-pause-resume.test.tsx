@@ -17,6 +17,7 @@ import type { WorkflowSummaryView } from '@/lib/automation/view-model'
 const routerRefresh = vi.hoisted(() => vi.fn())
 const pauseAction = vi.hoisted(() => vi.fn())
 const resumeAction = vi.hoisted(() => vi.fn())
+const notifyAction = vi.hoisted(() => vi.fn())
 const toastMock = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn(), info: vi.fn() }))
 
 vi.mock('next/navigation', () => ({
@@ -26,6 +27,7 @@ vi.mock('next/navigation', () => ({
 vi.mock('@/app/(app)/automation/actions', () => ({
   pauseWorkflowAction: pauseAction,
   resumeWorkflowAction: resumeAction,
+  setNotifyTeamEnabledAction: notifyAction,
 }))
 
 vi.mock('sonner', () => ({ toast: toastMock }))
@@ -42,6 +44,7 @@ const ACTIVE_WORKFLOW: WorkflowSummaryView = {
   lastRunLabel: '2 hours ago',
   lastRunStatus: 'SUCCEEDED',
   stats: [],
+  notifyTeamEnabled: true,
 }
 
 async function renderWorkflowDetail(workflow: WorkflowSummaryView = ACTIVE_WORKFLOW) {
@@ -146,5 +149,78 @@ describe('WorkflowDetail — Pause/Resume', () => {
       expect(toastMock.error).toHaveBeenCalledWith('You do not have permission to do that.'),
     )
     expect(routerRefresh).not.toHaveBeenCalled()
+  })
+})
+
+describe('WorkflowDetail — Notify Team switch', () => {
+  const DISABLED_WORKFLOW: WorkflowSummaryView = { ...ACTIVE_WORKFLOW, notifyTeamEnabled: false }
+
+  it('reflects the persisted state on first render', async () => {
+    await renderWorkflowDetail(DISABLED_WORKFLOW)
+
+    expect(screen.getByRole('switch', { name: /notify team/i })).not.toBeChecked()
+  })
+
+  it('switches the step off and reports it', async () => {
+    notifyAction.mockResolvedValue({ ok: true, data: { id: 'wf_1', notifyTeamEnabled: false } })
+    const user = userEvent.setup()
+    await renderWorkflowDetail()
+
+    await user.click(screen.getByRole('switch', { name: /notify team/i }))
+
+    await waitFor(() => expect(notifyAction).toHaveBeenCalledWith('wf_1', false))
+    await waitFor(() => expect(toastMock.success).toHaveBeenCalledWith('Team notifications off'))
+    expect(routerRefresh).toHaveBeenCalled()
+  })
+
+  it('switches the step back on', async () => {
+    notifyAction.mockResolvedValue({ ok: true, data: { id: 'wf_1', notifyTeamEnabled: true } })
+    const user = userEvent.setup()
+    await renderWorkflowDetail(DISABLED_WORKFLOW)
+
+    await user.click(screen.getByRole('switch', { name: /notify team/i }))
+
+    await waitFor(() => expect(notifyAction).toHaveBeenCalledWith('wf_1', true))
+    await waitFor(() => expect(toastMock.success).toHaveBeenCalledWith('Team notifications on'))
+  })
+
+  it('reverts the switch when the server refuses', async () => {
+    notifyAction.mockResolvedValue({
+      ok: false,
+      message: 'You do not have permission to do that.',
+    })
+    const user = userEvent.setup()
+    await renderWorkflowDetail()
+
+    const toggle = screen.getByRole('switch', { name: /notify team/i })
+    await user.click(toggle)
+
+    await waitFor(() =>
+      expect(toastMock.error).toHaveBeenCalledWith('You do not have permission to do that.'),
+    )
+    // Optimistic move undone — the control must not claim a state the server
+    // rejected.
+    await waitFor(() => expect(toggle).toBeChecked())
+    expect(routerRefresh).not.toHaveBeenCalled()
+  })
+
+  it('adopts the value the server reports, not the one requested', async () => {
+    // A concurrent toggle elsewhere already turned it back on.
+    notifyAction.mockResolvedValue({ ok: true, data: { id: 'wf_1', notifyTeamEnabled: true } })
+    const user = userEvent.setup()
+    await renderWorkflowDetail()
+
+    const toggle = screen.getByRole('switch', { name: /notify team/i })
+    await user.click(toggle)
+
+    await waitFor(() => expect(toastMock.success).toHaveBeenCalledWith('Team notifications on'))
+    await waitFor(() => expect(toggle).toBeChecked())
+  })
+
+  it('shows no switch on any other step', async () => {
+    await renderWorkflowDetail()
+
+    // Exactly one switch on the screen: only NOTIFY_TEAM is switchable.
+    expect(screen.getAllByRole('switch')).toHaveLength(1)
   })
 })

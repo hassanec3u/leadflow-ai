@@ -58,7 +58,13 @@ vi.mock('@/lib/db/prisma', () => {
         where: Record<string, unknown>
         data: Record<string, unknown>
       }) => {
-        const workflow = state.workflows.find((w) => w.id === where.id && w.status === where.status)
+        // Matches on EVERY condition present, not just `status`: both toggles
+        // key their conditional update on the column they are about, so a fake
+        // hardcoded to one of them would silently report "no rows" for the
+        // other.
+        const workflow = state.workflows.find((w) =>
+          Object.entries(where).every(([key, value]) => w[key] === value),
+        )
         if (!workflow) return { count: 0 }
         Object.assign(workflow, data)
         return { count: 1 }
@@ -193,12 +199,18 @@ async function service() {
   return import('@/lib/services/automation-workflow-status')
 }
 
-function seedWorkflow(options: { id: string; status: 'ACTIVE' | 'PAUSED'; type?: string }) {
+function seedWorkflow(options: {
+  id: string
+  status: 'ACTIVE' | 'PAUSED'
+  type?: string
+  notifyTeamEnabled?: boolean
+}) {
   state.workflows.push({
     id: options.id,
     status: options.status,
     type: options.type ?? 'LEAD_QUALIFICATION',
     version: 1,
+    notifyTeamEnabled: options.notifyTeamEnabled ?? true,
   })
 }
 
@@ -397,5 +409,67 @@ describe('pause/resume — wiring proof against the real (unmocked) enrollment s
     expect(emitRunRequestedMock).toHaveBeenCalledWith(
       expect.objectContaining({ trigger: 'AUTOMATIC' }),
     )
+  })
+})
+
+describe('notify-team switch', () => {
+  it('refuses a SALES_REP, and changes nothing', async () => {
+    seedWorkflow({ id: 'wf_1', status: 'ACTIVE', notifyTeamEnabled: true })
+    state.role = 'SALES_REP'
+    const { setNotifyTeamEnabledForCurrentUser } = await service()
+
+    await expect(setNotifyTeamEnabledForCurrentUser('wf_1', false)).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+    })
+    expect(state.workflows[0]?.notifyTeamEnabled).toBe(true)
+  })
+
+  it.each(['ADMIN', 'MANAGER'] as const)('allows %s to switch it off', async (role) => {
+    seedWorkflow({ id: 'wf_1', status: 'ACTIVE', notifyTeamEnabled: true })
+    state.role = role
+    const { setNotifyTeamEnabledForCurrentUser } = await service()
+
+    const result = await setNotifyTeamEnabledForCurrentUser('wf_1', false)
+
+    expect(result).toEqual({ id: 'wf_1', notifyTeamEnabled: false })
+    expect(state.workflows[0]?.notifyTeamEnabled).toBe(false)
+  })
+
+  it('switches it back on', async () => {
+    seedWorkflow({ id: 'wf_1', status: 'ACTIVE', notifyTeamEnabled: false })
+    const { setNotifyTeamEnabledForCurrentUser } = await service()
+
+    const result = await setNotifyTeamEnabledForCurrentUser('wf_1', true)
+
+    expect(result).toEqual({ id: 'wf_1', notifyTeamEnabled: true })
+    expect(state.workflows[0]?.notifyTeamEnabled).toBe(true)
+  })
+
+  it('is idempotent: setting the value it already holds reports success', async () => {
+    seedWorkflow({ id: 'wf_1', status: 'ACTIVE', notifyTeamEnabled: false })
+    const { setNotifyTeamEnabledForCurrentUser } = await service()
+
+    // A double click, or a second tab, must not surface as a conflict.
+    const result = await setNotifyTeamEnabledForCurrentUser('wf_1', false)
+
+    expect(result).toEqual({ id: 'wf_1', notifyTeamEnabled: false })
+  })
+
+  it('reports an unknown workflow as not found', async () => {
+    const { setNotifyTeamEnabledForCurrentUser } = await service()
+
+    await expect(setNotifyTeamEnabledForCurrentUser('wf_missing', false)).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+    })
+  })
+
+  it('leaves the pause state alone — the two switches are independent', async () => {
+    seedWorkflow({ id: 'wf_1', status: 'PAUSED', notifyTeamEnabled: true })
+    const { setNotifyTeamEnabledForCurrentUser } = await service()
+
+    await setNotifyTeamEnabledForCurrentUser('wf_1', false)
+
+    expect(state.workflows[0]?.status).toBe('PAUSED')
+    expect(state.workflows[0]?.notifyTeamEnabled).toBe(false)
   })
 })

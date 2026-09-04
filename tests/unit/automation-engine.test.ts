@@ -39,6 +39,7 @@ const state = vi.hoisted(() => {
     type: string
     status: string
     version: number
+    notifyTeamEnabled: boolean
   }
   type Enrollment = { id: string; workflowId: string; leadId: string }
   /** Append-only qualification config versions. */
@@ -416,6 +417,7 @@ function seedRun(options: { leadOverrides?: Record<string, unknown> } = {}) {
     type: 'LEAD_QUALIFICATION',
     status: 'ACTIVE',
     version: 1,
+    notifyTeamEnabled: true,
   }
   const enrollment = {
     id: state.id('enr'),
@@ -768,6 +770,57 @@ describe('Automation execution engine', () => {
     expect(notification.notify).toHaveBeenCalledWith(
       expect.objectContaining({ kind: 'run_failed' }),
     )
+  })
+
+  describe('the Notify Team switch', () => {
+    it('SKIPs the step, without calling the provider, when the switch is off', async () => {
+      const { executeWorkflowRun } = await importEngine()
+      const { run, workflow } = seedRun()
+      workflow.notifyTeamEnabled = false
+      const notification = makeNotification()
+
+      const result = await executeWorkflowRun(
+        { runId: run.id },
+        { providers: makeRegistry({ notification }), sleep: noSleep },
+      )
+
+      expect(stepStatus(run.id, 'NOTIFY_TEAM')?.status).toBe('SKIPPED')
+      expect(stepStatus(run.id, 'NOTIFY_TEAM')?.errorCode).toBe('step_disabled')
+      // Off means the vendor is never called — not called-and-discarded.
+      expect(notification.notify).not.toHaveBeenCalled()
+      // Turning one optional step off must not change the run's own verdict.
+      expect(result.runStatus).toBe('SUCCEEDED')
+    })
+
+    it('runs the step normally when the switch is on', async () => {
+      const { executeWorkflowRun } = await importEngine()
+      const { run, workflow } = seedRun()
+      workflow.notifyTeamEnabled = true
+      const notification = makeNotification()
+
+      await executeWorkflowRun(
+        { runId: run.id },
+        { providers: makeRegistry({ notification }), sleep: noSleep },
+      )
+
+      expect(stepStatus(run.id, 'NOTIFY_TEAM')?.status).toBe('SUCCEEDED')
+      expect(notification.notify).toHaveBeenCalledTimes(1)
+    })
+
+    it('still SKIPs for a missing provider, and says so distinctly', async () => {
+      const { executeWorkflowRun } = await importEngine()
+      const { run, workflow } = seedRun()
+      workflow.notifyTeamEnabled = true
+
+      await executeWorkflowRun(
+        { runId: run.id },
+        { providers: makeRegistry({ notification: null }), sleep: noSleep },
+      )
+
+      // "You switched it off" and "nothing is connected" are different
+      // situations and must stay distinguishable on the run.
+      expect(stepStatus(run.id, 'NOTIFY_TEAM')?.errorCode).toBe('provider_not_configured')
+    })
   })
 
   it('15. notification failure is non-blocking: run outcome unchanged', async () => {
