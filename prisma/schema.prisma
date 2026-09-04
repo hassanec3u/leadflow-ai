@@ -1,14 +1,18 @@
 // LeadFlow AI — Prisma schema
 //
-// Phase 0 scope: Organization, User, and the models Auth.js requires.
-// Phase 1A adds the Lead database foundation only (docs/roadmap.md) — no
-// CRUD, no CSV import, no AI qualification, no workflow engine yet.
-// Remaining business models (Campaign, Workflow*, AIInsight, ...) are still
-// NOT defined here — they belong to later phases (see docs/roadmap.md).
+// SINGLE-TENANT. This application serves exactly one company per deployment.
+// There is no Organization model, no `organizationId` column, and no row level
+// security: with one tenant there is nothing to isolate rows from.
 //
-// Multi-tenancy: every tenant-owned table carries `organizationId` and is
-// protected by Postgres RLS. See prisma/migrations/*_rls/migration.sql and
-// docs/architecture.md §4 / §11.
+// Do NOT reintroduce an organization/tenant concept without an explicit
+// decision to make the product multi-tenant again. Earlier phase documents
+// (docs/roadmap.md, docs/product-spec.md) were written while the product was
+// multi-tenant; where they mention organizations, that history no longer
+// applies. See docs/architecture.md §4.
+//
+// Access control that DOES still apply, and is enforced in application code:
+// role/capability checks (lib/auth/rbac.ts, lib/auth/session.ts) and the Lead
+// ownership scope — a SALES_REP sees only leads they own (lib/services/leads.ts).
 
 generator client {
   provider = "prisma-client-js"
@@ -27,79 +31,33 @@ enum Role {
   SALES_REP
 }
 
-/// Tenant root. Every tenant-owned row resolves to exactly one Organization.
-model Organization {
-  id                    String    @id @default(cuid())
-  name                  String
-  slug                  String    @unique
-  /// SHA-256 (hex) of the organization's Website Form capture secret — never
-  /// the secret itself (Phase 2E-1, docs/architecture.md §6 "per-org signing
-  /// secret we issue"). Null until an admin issues one, which is why the
-  /// public capture endpoint simply cannot resolve a tenant for that org.
-  ///
-  /// A DETERMINISTIC hash, deliberately not bcrypt: the credential is looked
-  /// UP by its hash (one indexed equality), and a per-hash salt would force a
-  /// scan of every organization to find a match. Safe here because the secret
-  /// is 256 bits of CSPRNG output — not a human-chosen password — so it has
-  /// no dictionary/brute-force surface for a salt to defend. Same treatment
-  /// as any API key.
-  ///
-  /// Unique so one secret can never resolve to two organizations; Postgres
-  /// allows many NULLs under a unique index, so un-issued orgs are unaffected.
-  formCaptureSecretHash String?   @unique
-  createdAt             DateTime  @default(now())
-  updatedAt             DateTime  @updatedAt
-  deletedAt             DateTime?
-
-  users                       User[]
-  leads                       Lead[]
-  workflows                   Workflow[]
-  workflowEnrollments         WorkflowEnrollment[]
-  workflowRuns                WorkflowRun[]
-  qualificationConfigVersions QualificationConfigVersion[]
-
-  @@index([deletedAt])
-  @@map("organizations")
-}
-
-/// A user always belongs to exactly one Organization.
-///
-/// `email` is globally unique, not unique-per-org. Auth.js resolves a login
-/// identity by email BEFORE any organization context exists, so a per-org
-/// unique constraint would make "which account is this?" ambiguous at sign-in.
-/// Consequence (documented, accepted for MVP): one email address maps to one
-/// organization. Multi-org membership would require a separate Membership
-/// join model and an org-selection step at login — out of scope for Phase 0.
+/// An application user. Accounts are provisioned by an operator (there is no
+/// public sign-up — see prisma/seed.ts), so `role` is set deliberately at
+/// creation rather than defaulted into by whoever registers first.
 model User {
-  id             String    @id @default(cuid())
-  organizationId String
-  name           String?
-  email          String    @unique
-  emailVerified  DateTime?
-  image          String?
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
   /// bcrypt hash. Null for users who only ever sign in via an OAuth provider.
-  passwordHash   String?
-  role           Role      @default(SALES_REP)
+  passwordHash  String?
+  role          Role      @default(SALES_REP)
   /// Slack identity for owner-DM notifications (Phase 5). Null => channel fallback.
-  slackUserId    String?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  slackUserId   String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 
-  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  accounts     Account[]
-  sessions     Session[]
+  accounts   Account[]
+  sessions   Session[]
   /// Leads owned by this user. Lead.ownerId is nullable — a Lead may be Unassigned.
-  ownedLeads   Lead[]       @relation("LeadOwner")
+  ownedLeads Lead[]    @relation("LeadOwner")
 
-  @@index([organizationId])
-  @@index([organizationId, role])
   @@map("users")
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1A — Lead database foundation only. See docs/roadmap.md Phase 1 and
-// docs/product-spec.md §5 for the full field list and the source-of-truth
-// this model implements.
+// Lead. See docs/product-spec.md §5 for the field list this model implements.
 // ---------------------------------------------------------------------------
 
 /// Where a Lead entered the system. Drives whether it auto-enrolls in the
@@ -143,8 +101,7 @@ enum QualificationSource {
 
 /// Sales/process state. Per docs/product-spec.md §5 this is DERIVED — it must
 /// only ever be recomputed from the latest WorkflowRunStep/EmailEvent
-/// (Phase 2+), never hand-set independently of those. No such derivation
-/// logic exists yet in Phase 1A; this column just holds the value.
+/// (Phase 2+), never hand-set independently of those.
 enum LeadStatus {
   NEW
   ENRICHING
@@ -156,14 +113,9 @@ enum LeadStatus {
   LOST
 }
 
-/// A captured lead. Tenant-owned: protected by Postgres RLS
-/// (prisma/migrations/*_lead_rls) exactly like `organizations` and `users`.
-///
-/// Phase 1A ships the model, migration and RLS only — no CRUD, no API, no
-/// CSV import, no AI qualification, no workflow engine (see docs/roadmap.md).
+/// A captured lead.
 model Lead {
   id                     String                    @id @default(cuid())
-  organizationId         String
   /// Nullable (Phase 1.1 business-rules closure): a Lead may exist
   /// "Unassigned" (ownerId = null). No fake system owner and no
   /// auto-assignment to an admin — null simply means nobody owns it yet. See
@@ -174,8 +126,7 @@ model Lead {
   name                   String
   /// Nullable: docs/architecture.md §5 step 2 (Enrich Data) populates
   /// company/firmographic data after capture — a webhook/form lead may not
-  /// carry it yet at creation time. Not explicitly annotated in
-  /// product-spec.md §5; inferred from the enrichment step description.
+  /// carry it yet at creation time.
   company                String?
   email                  String
   /// Nullable for the same reason as `company` — not every capture source
@@ -198,13 +149,10 @@ model Lead {
   source                 LeadSource
   /// AI qualification score, 0–100. Null means "not yet scored" or "AI
   /// output failed validation, needs manual review" — never a default 0
-  /// (docs/product-spec.md §5). Phase 1A never writes this; Phase 3 does.
+  /// (docs/product-spec.md §5).
   aiScore                Int?
   /// Derived from `aiScore` once qualification has run (Phase 3). Null until
-  /// then, mirroring `aiScore`'s null-until-scored semantics — product-spec.md
-  /// §5 does not explicitly annotate this field as nullable; this is an
-  /// inferred consequence of `aiScore` being nullable and should be confirmed
-  /// with the spec owner.
+  /// then, mirroring `aiScore`'s null-until-scored semantics.
   qualification          LeadQualification?
   /// Phase 2C (D1): the pipeline's binary QUALIFIED/UNQUALIFIED outcome.
   /// Null until AI qualification has run (or a human has decided).
@@ -220,31 +168,25 @@ model Lead {
   updatedAt              DateTime                  @updatedAt
   lastActionAt           DateTime                  @default(now())
 
-  organization        Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   owner               User?                @relation("LeadOwner", fields: [ownerId], references: [id], onDelete: Restrict)
   workflowEnrollments WorkflowEnrollment[]
   workflowRuns        WorkflowRun[]
 
-  /// Tenant-scoped email uniqueness (docs/product-spec.md §5), enforced on the
-  /// normalized (trimmed, lowercased — see lib/validation/leads.ts) email. A
-  /// duplicate within an org is rejected (ConflictError), not merged/upserted
-  /// — see lib/services/leads.ts. Deliberately NOT a global unique on `email`
-  /// alone: the same person may be a lead at two different tenant
-  /// organizations. This index is NOT filtered by `deletedAt`: a soft-deleted
-  /// Lead keeps its email identity, so its email cannot be reused by a new
-  /// Lead in the same org (Phase 1.1 business-rules closure).
-  @@unique([organizationId, email])
-  @@index([organizationId])
+  /// Email uniqueness (docs/product-spec.md §5), enforced on the normalized
+  /// (trimmed, lowercased — see lib/validation/leads.ts) email. A duplicate is
+  /// rejected (ConflictError), not merged/upserted — see lib/services/leads.ts.
+  /// This index is NOT filtered by `deletedAt`: a soft-deleted Lead keeps its
+  /// email identity, so its email cannot be reused by a new Lead (Phase 1.1
+  /// business-rules closure).
+  @@unique([email])
   @@map("leads")
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2A — Automation domain model only. See docs/architecture.md §10 (the
-// scope correction to a single fixed pipeline, not a multi-workflow builder)
-// and docs/roadmap.md Phase 2. This ships the persistence shape only: no
-// enrollment service, no Inngest, no execution, no providers, no API/UI
-// (those are Phase 2B+). The pipeline's steps are fixed in application code
-// (WorkflowStepKind below) — there is deliberately no WorkflowStep table.
+// Automation domain model. See docs/architecture.md §10 (a single fixed
+// pipeline, not a multi-workflow builder) and docs/roadmap.md Phase 2. The
+// pipeline's steps are fixed in application code (WorkflowStepKind below) —
+// there is deliberately no WorkflowStep table.
 // ---------------------------------------------------------------------------
 
 /// The MVP ships exactly one workflow type. Kept as an enum (not a free-form
@@ -260,29 +202,24 @@ enum WorkflowStatus {
   PAUSED
 }
 
-/// One fixed pipeline per organization, auto-provisioned (not user-created —
-/// docs/architecture.md §10). Provisioning itself is Phase 2B; this model only
-/// makes the row representable and enforces "exactly one LEAD_QUALIFICATION
-/// workflow per org" at the database level.
+/// The single fixed pipeline, auto-provisioned rather than user-created
+/// (docs/architecture.md §10).
 model Workflow {
-  id             String         @id @default(cuid())
-  organizationId String
-  type           WorkflowType
-  status         WorkflowStatus @default(ACTIVE)
+  id        String         @id @default(cuid())
+  type      WorkflowType
+  status    WorkflowStatus @default(ACTIVE)
   /// Copied onto each WorkflowRun at creation time, so a run always records
   /// which pipeline definition it executed even if `version` is bumped later.
-  version        Int            @default(1)
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
+  version   Int            @default(1)
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
 
-  organization Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  enrollments  WorkflowEnrollment[]
-  runs         WorkflowRun[]
+  enrollments WorkflowEnrollment[]
+  runs        WorkflowRun[]
 
-  /// Enforces "one LEAD_QUALIFICATION workflow per organization" at the
-  /// database level, not just in application logic.
-  @@unique([organizationId, type])
-  @@index([organizationId])
+  /// Enforces "exactly one LEAD_QUALIFICATION workflow exists" at the database
+  /// level, not just in application logic.
+  @@unique([type])
   @@map("workflows")
 }
 
@@ -295,25 +232,22 @@ enum WorkflowEnrollmentTrigger {
 /// Deliberately holds only enrollment identity/metadata, not execution state
 /// (that's WorkflowRun) — an enrollment can exist with zero, one, or later
 /// more than one associated run (a re-run creates a new WorkflowRun, not a
-/// new enrollment). The enrollment service itself is Phase 2B.
+/// new enrollment).
 model WorkflowEnrollment {
-  id             String                    @id @default(cuid())
-  organizationId String
-  workflowId     String
-  leadId         String
-  trigger        WorkflowEnrollmentTrigger @default(AUTOMATIC)
-  enrolledAt     DateTime                  @default(now())
-  createdAt      DateTime                  @default(now())
+  id         String                    @id @default(cuid())
+  workflowId String
+  leadId     String
+  trigger    WorkflowEnrollmentTrigger @default(AUTOMATIC)
+  enrolledAt DateTime                  @default(now())
+  createdAt  DateTime                  @default(now())
 
-  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  workflow     Workflow      @relation(fields: [workflowId], references: [id], onDelete: Cascade)
-  lead         Lead          @relation(fields: [leadId], references: [id], onDelete: Cascade)
-  runs         WorkflowRun[]
+  workflow Workflow      @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  lead     Lead          @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  runs     WorkflowRun[]
 
   /// Automatic-enrollment identity: the same lead is never auto-enrolled in
   /// the same workflow more than once (docs/product-spec.md §8 dedup rule).
   @@unique([workflowId, leadId])
-  @@index([organizationId])
   @@index([leadId])
   @@map("workflow_enrollments")
 }
@@ -329,19 +263,17 @@ enum WorkflowRunStatus {
   SUCCEEDED
   FAILED
   /// Phase 2C (D2): a configuration/precondition prevented normal completion
-  /// — e.g. a qualified lead whose organization has no email provider
-  /// connected. Never used for a provider that was actually called and
-  /// failed; that is FAILED.
+  /// — e.g. a qualified lead with no email provider connected. Never used for
+  /// a provider that was actually called and failed; that is FAILED.
   BLOCKED
 }
 
 /// One execution instance of a workflow for one lead. Distinct from
 /// WorkflowEnrollment: an enrollment is enrolled once, but re-running
-/// (explicit user action, Phase 2B) creates a new WorkflowRun from the
-/// beginning, not a new enrollment.
+/// (explicit user action) creates a new WorkflowRun from the beginning, not a
+/// new enrollment.
 model WorkflowRun {
   id                           String             @id @default(cuid())
-  organizationId               String
   workflowId                   String
   /// Required (Phase 2C, decision D3): every run — automatic or manual —
   /// belongs to the lead's single enrollment. A MANUAL_RERUN creates a NEW
@@ -373,7 +305,6 @@ model WorkflowRun {
   createdAt                    DateTime           @default(now())
   updatedAt                    DateTime           @updatedAt
 
-  organization               Organization                @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   workflow                   Workflow                    @relation(fields: [workflowId], references: [id], onDelete: Cascade)
   enrollment                 WorkflowEnrollment          @relation(fields: [workflowEnrollmentId], references: [id], onDelete: Cascade)
   lead                       Lead                        @relation(fields: [leadId], references: [id], onDelete: Cascade)
@@ -382,8 +313,8 @@ model WorkflowRun {
   /// against would destroy the explanation of its score.
   qualificationConfigVersion QualificationConfigVersion? @relation(fields: [qualificationConfigVersionId], references: [id], onDelete: Restrict)
 
-  /// Two partial unique indexes live in the Phase 2C migration and CANNOT be
-  /// expressed here (Prisma has no filtered-index syntax for PostgreSQL):
+  /// Two partial unique indexes live in the migration and CANNOT be expressed
+  /// here (Prisma has no filtered-index syntax for PostgreSQL):
   ///   workflow_runs_automatic_per_enrollment_key
   ///     UNIQUE ("workflowEnrollmentId") WHERE trigger = 'AUTOMATIC'
   ///       -> at most one automatic run per enrollment (invariants 1 + 2)
@@ -391,7 +322,6 @@ model WorkflowRun {
   ///     UNIQUE ("leadId") WHERE status IN ('PENDING','RUNNING')
   ///       -> at most one in-flight run per lead (makes re-run safe)
   /// Do not drop them by regenerating this model from the database.
-  @@index([organizationId])
   @@index([workflowId])
   @@index([leadId])
   @@index([workflowEnrollmentId])
@@ -424,15 +354,7 @@ enum WorkflowStepRunStatus {
   BLOCKED
 }
 
-/// Execution record for one step within one WorkflowRun. Retries are
-/// represented by `attempts` on this same row — there is no separate
-/// StepAttempt history table for MVP.
-///
-/// Not tenant-owned directly (no organizationId column): a WorkflowStepRun
-/// has no independent existence outside its WorkflowRun, so tenant isolation
-/// is enforced by joining through workflow_runs.organizationId in its RLS
-/// policy — the same shape Prisma's relation already models.
-/// An immutable snapshot of one organization's qualification configuration.
+/// An immutable snapshot of the qualification configuration.
 ///
 /// APPEND-ONLY BY DESIGN. Saving a change never updates a row — it inserts a
 /// new one with the next `version`. A WorkflowRun points at the row it was
@@ -443,31 +365,31 @@ enum WorkflowStepRunStatus {
 /// Deliberately NOT versioned through `Workflow.version`: a version number
 /// alone cannot restore the ICP text that produced a past score.
 model QualificationConfigVersion {
-  id             String   @id @default(cuid())
-  organizationId String
-  /// Monotonic per organization, starting at 1.
-  version        Int
-  /// The organization's Ideal Customer Profile, free text (max 5000 chars,
-  /// enforced in lib/validation/qualification-config.ts).
-  icp            String
+  id           String   @id @default(cuid())
+  /// Monotonic, starting at 1.
+  version      Int
+  /// The Ideal Customer Profile, free text (max 5000 chars, enforced in
+  /// lib/validation/qualification-config.ts).
+  icp          String
   /// Optional extra qualification guidance (max 3000 chars).
-  instructions   String?
+  instructions String?
   /// Score at or above which a lead is QUALIFIED. 0-100.
-  threshold      Int
+  threshold    Int
   /// Who saved it — for an audit trail the append-only history makes useful.
-  createdById    String?
-  createdAt      DateTime @default(now())
+  createdById  String?
+  createdAt    DateTime @default(now())
 
-  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  runs         WorkflowRun[]
+  runs WorkflowRun[]
 
-  /// One row per (organization, version): the insert itself is what serialises
-  /// two admins saving at once — the loser retries against the new latest.
-  @@unique([organizationId, version])
-  @@index([organizationId])
+  /// One row per version: the insert itself is what serialises two admins
+  /// saving at once — the loser retries against the new latest.
+  @@unique([version])
   @@map("qualification_config_versions")
 }
 
+/// Execution record for one step within one WorkflowRun. Retries are
+/// represented by `attempts` on this same row — there is no separate
+/// StepAttempt history table for MVP.
 model WorkflowStepRun {
   id            String                @id @default(cuid())
   workflowRunId String
@@ -477,8 +399,7 @@ model WorkflowStepRun {
   startedAt     DateTime?
   completedAt   DateTime?
   /// Step-scoped input/output only (e.g. the AI prompt/response for
-  /// AI_QUALIFY) — never a full Lead snapshot. Populated by the execution
-  /// layer, Phase 2B+; this model only provides the column.
+  /// AI_QUALIFY) — never a full Lead snapshot.
   input         Json?
   output        Json?
   errorCode     String?

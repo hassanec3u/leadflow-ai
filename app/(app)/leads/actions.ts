@@ -20,9 +20,9 @@ import {
  *
  * Thin by design (see app/(auth)/actions.ts for the same pattern): parsing
  * happens in the service, not here; each action only invokes it and maps
- * failures to a client-safe message (+ field errors where useful).
- * `organizationId` never appears in any input here — it comes from the
- * session inside the service (via `requireUser()`/`withTenant()`).
+ * failures to a client-safe message (+ field errors where useful). The caller
+ * is resolved from the session inside the service (via `requireUser()`), never
+ * from anything the client sends.
  */
 export type ListLeadsActionResult =
   { ok: true; data: ListLeadsResult } | { ok: false; message: string }

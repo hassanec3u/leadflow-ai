@@ -3,7 +3,7 @@ import 'server-only'
 import type { Prisma, WorkflowStepKind } from '@prisma/client'
 
 import { requireCapability } from '@/lib/auth/session'
-import { withTenant, type TenantDb } from '@/lib/db/tenant'
+import { prisma } from '@/lib/db/prisma'
 import { QUALIFICATION_THRESHOLD } from '@/lib/automation/pipeline'
 import { parseAiQualificationOutput } from '@/lib/validation/automation-ai'
 import {
@@ -26,11 +26,8 @@ import {
 /**
  * Read services for the Automation screens (Phase 2G).
  *
- * Every function here resolves the tenant from the SESSION and nothing else:
- * `requireCapability('automation:manage')` returns the signed-in user, whose
- * `organizationId` is what reaches `withTenant()`. No caller can pass an
- * organization in — there is no parameter to pass it through — and Postgres
- * RLS remains the second barrier underneath.
+ * Every function here gates on `requireCapability('automation:manage')`
+ * against the session before reading anything.
  *
  * Read-only by construction: nothing in this module writes.
  */
@@ -42,10 +39,10 @@ function windowStart(days: number, now: Date): Date {
   return new Date(now.getTime() - days * 86_400_000)
 }
 
-/** The one fixed workflow, or null when the organization has never captured a lead. */
-async function findWorkflow(tx: TenantDb, organizationId: string) {
-  return tx.workflow.findFirst({
-    where: { organizationId, type: 'LEAD_QUALIFICATION' },
+/** The one fixed workflow, or null when no lead has ever been captured. */
+async function findWorkflow(db: Pick<typeof prisma, 'workflow'>) {
+  return db.workflow.findFirst({
+    where: { type: 'LEAD_QUALIFICATION' },
     select: { id: true, status: true, version: true, createdAt: true },
   })
 }
@@ -248,17 +245,19 @@ export type AutomationOverview = {
 }
 
 /**
- * Headline metrics plus the organization's single pipeline.
+ * Headline metrics plus the single pipeline.
  *
  * Counts come from real aggregate queries. Where a figure cannot be computed
  * from stored data it is not shown at all rather than estimated — there is no
  * invented trend on this screen.
  */
 export async function getAutomationOverview(now: Date = new Date()): Promise<AutomationOverview> {
-  const user = await requireCapability('automation:manage')
+  await requireCapability('automation:manage')
 
-  return withTenant(user.organizationId, async (tx) => {
-    const workflow = await findWorkflow(tx, user.organizationId)
+  // Transaction: these aggregates are shown side by side as one picture, so
+  // they must be counted against a single snapshot.
+  return prisma.$transaction(async (tx) => {
+    const workflow = await findWorkflow(tx)
     if (!workflow) return { workflow: null, kpis: [] }
 
     const since = windowStart(RUNS_WINDOW_DAYS, now)
@@ -333,36 +332,30 @@ export async function getWorkflowDetail(now: Date = new Date()) {
  * lead and step rows come back through relations in ONE query — no N+1.
  */
 export async function listWorkflowRuns(now: Date = new Date()): Promise<WorkflowRunView[]> {
-  const user = await requireCapability('automation:manage')
+  await requireCapability('automation:manage')
 
-  return withTenant(user.organizationId, async (tx) => {
-    const runs = await tx.workflowRun.findMany({
-      orderBy: { createdAt: 'desc' },
-      take: RECENT_RUNS_LIMIT,
-      select: RUN_WITH_LEAD_SELECT,
-    })
-
-    return runs.map((run) => toRunView(run, now))
+  const runs = await prisma.workflowRun.findMany({
+    orderBy: { createdAt: 'desc' },
+    take: RECENT_RUNS_LIMIT,
+    select: RUN_WITH_LEAD_SELECT,
   })
+
+  return runs.map((run) => toRunView(run, now))
 }
 
-/** One run with its step rows, or null when it does not exist in this tenant. */
+/** One run with its step rows, or null when it does not exist. */
 export async function getWorkflowRunDetail(
   runId: string,
   now: Date = new Date(),
 ): Promise<WorkflowRunView | null> {
-  const user = await requireCapability('automation:manage')
+  await requireCapability('automation:manage')
 
-  return withTenant(user.organizationId, async (tx) => {
-    const run = await tx.workflowRun.findFirst({
-      where: { id: runId },
-      select: RUN_WITH_LEAD_SELECT,
-    })
-
-    // A run belonging to another tenant is invisible under RLS, so this is
-    // the same "not found" as an id that never existed — no oracle.
-    return run ? toRunView(run, now) : null
+  const run = await prisma.workflowRun.findFirst({
+    where: { id: runId },
+    select: RUN_WITH_LEAD_SELECT,
   })
+
+  return run ? toRunView(run, now) : null
 }
 
 export type LeadAutomationStatus = {
@@ -378,16 +371,17 @@ export type LeadAutomationStatus = {
 /**
  * The Lead detail Automation tab.
  *
- * Returns null when the lead is not visible to this tenant OR is soft-deleted
- * — matching how the rest of the Leads surface treats a deleted record.
+ * Returns null when the lead does not exist OR is soft-deleted — matching how
+ * the rest of the Leads surface treats a deleted record.
  */
 export async function getLeadAutomationStatus(
   leadId: string,
   now: Date = new Date(),
 ): Promise<LeadAutomationStatus> {
-  const user = await requireCapability('automation:manage')
+  await requireCapability('automation:manage')
 
-  return withTenant(user.organizationId, async (tx) => {
+  // Transaction: the lead and its latest run are rendered as one state.
+  return prisma.$transaction(async (tx) => {
     const lead = await tx.lead.findFirst({
       where: { id: leadId, deletedAt: null },
       select: {

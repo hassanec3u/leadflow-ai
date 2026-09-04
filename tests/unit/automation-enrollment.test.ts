@@ -4,24 +4,20 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 /**
  * Phase 2B — lib/services/automation-enrollment.ts.
  *
- * Mirrors tests/unit/leads-service.test.ts: `@/lib/db/prisma` is replaced
- * with a small in-memory fake that mimics just enough of Prisma + Postgres
- * RLS to prove the SERVICE's own logic — tenant scoping, eligibility,
- * idempotency, and the duplicate-lead merge rule. A row is only "visible"
- * when its `organizationId` matches whatever the last `withTenant()` call set
- * via `$executeRaw` (mirroring `SET LOCAL app.current_org_id`), exactly like
- * RLS — so a service bug that forgot tenant scoping would surface here as
- * cross-tenant leakage, the same guarantee leads-service.test.ts relies on.
+ * Mirrors tests/unit/leads-service.test.ts: `@/lib/db/prisma` is replaced with
+ * a small in-memory fake that mimics just enough of Prisma to prove the
+ * SERVICE's own logic — eligibility, idempotency, and the duplicate-lead merge
+ * rule. The fake enforces the same unique constraints the real schema does, so
+ * the service's constraint-violation handling is exercised for real.
  *
- * Real Postgres RLS/constraints on the automation tables are proven
- * separately in tests/integration/automation-domain.test.ts (Phase 2A) — this
- * file is about the enrollment service's own logic sitting in front of them.
+ * Real Postgres constraints on the automation tables are proven separately in
+ * tests/integration/automation-domain.test.ts (Phase 2A) — this file is about
+ * the enrollment service's own logic sitting in front of them.
  */
 
 const state = vi.hoisted(() => {
   type FakeLead = {
     id: string
-    organizationId: string
     name: string
     email: string
     company: string | null
@@ -33,14 +29,12 @@ const state = vi.hoisted(() => {
   }
   type FakeWorkflow = {
     id: string
-    organizationId: string
     type: string
     status: 'ACTIVE' | 'PAUSED'
     version: number
   }
   type FakeEnrollment = {
     id: string
-    organizationId: string
     workflowId: string
     leadId: string
     trigger: string
@@ -49,7 +43,6 @@ const state = vi.hoisted(() => {
   /** Phase 2C: capture now also creates the PENDING run for a new enrollment. */
   type FakeRun = {
     id: string
-    organizationId: string
     workflowId: string
     workflowEnrollmentId: string
     leadId: string
@@ -62,7 +55,6 @@ const state = vi.hoisted(() => {
   const workflows: FakeWorkflow[] = []
   const enrollments: FakeEnrollment[] = []
   const runs: FakeRun[] = []
-  let currentOrgId: string | null = null
   let nextId = 1
 
   function reset() {
@@ -70,14 +62,7 @@ const state = vi.hoisted(() => {
     workflows.length = 0
     enrollments.length = 0
     runs.length = 0
-    currentOrgId = null
     nextId = 1
-  }
-
-  // Fails closed exactly like RLS: nothing is visible with no tenant context,
-  // and nothing outside the current tenant is visible either.
-  function visible(row: { organizationId: string }) {
-    return currentOrgId !== null && row.organizationId === currentOrgId
   }
 
   return {
@@ -86,12 +71,8 @@ const state = vi.hoisted(() => {
     enrollments,
     runs,
     reset,
-    visible,
     get nextId() {
       return `id_${nextId++}`
-    },
-    setOrgContext: (id: string) => {
-      currentOrgId = id
     },
   }
 })
@@ -120,31 +101,22 @@ function uniqueViolation(constraintIndex: string) {
 
 vi.mock('@/lib/db/prisma', () => {
   const tx = {
-    $executeRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => {
-      state.setOrgContext(values[0] as string)
-      return 1
-    },
     lead: {
       findFirst: async ({ where }: { where: Record<string, unknown> }) => {
         return (
           state.leads.find(
             (l) =>
-              state.visible(l) &&
-              l.organizationId === where.organizationId &&
-              l.email === where.email &&
-              (where.deletedAt === null ? l.deletedAt === null : true),
+              l.email === where.email && (where.deletedAt === null ? l.deletedAt === null : true),
           ) ?? null
         )
       },
       create: async ({ data }: { data: Record<string, unknown> }) => {
-        const organizationId = data.organizationId as string
         const email = data.email as string
-        if (state.leads.some((l) => l.organizationId === organizationId && l.email === email)) {
-          throw uniqueViolation('leads_organizationId_email_key')
+        if (state.leads.some((l) => l.email === email)) {
+          throw uniqueViolation('leads_email_key')
         }
         const lead = {
           id: state.nextId,
-          organizationId,
           name: data.name as string,
           email,
           company: (data.company as string | undefined) ?? null,
@@ -165,24 +137,15 @@ vi.mock('@/lib/db/prisma', () => {
     },
     workflow: {
       findFirst: async ({ where }: { where: Record<string, unknown> }) => {
-        return (
-          state.workflows.find(
-            (w) =>
-              state.visible(w) &&
-              w.organizationId === where.organizationId &&
-              w.type === where.type,
-          ) ?? null
-        )
+        return state.workflows.find((w) => w.type === where.type) ?? null
       },
       create: async ({ data }: { data: Record<string, unknown> }) => {
-        const organizationId = data.organizationId as string
         const type = data.type as string
-        if (state.workflows.some((w) => w.organizationId === organizationId && w.type === type)) {
-          throw uniqueViolation('workflows_organizationId_type_key')
+        if (state.workflows.some((w) => w.type === type)) {
+          throw uniqueViolation('workflows_type_key')
         }
         const workflow = {
           id: state.nextId,
-          organizationId,
           type,
           status: (data.status as 'ACTIVE' | 'PAUSED') ?? 'ACTIVE',
           version: (data.version as number) ?? 1,
@@ -195,7 +158,6 @@ vi.mock('@/lib/db/prisma', () => {
       findFirst: async ({ where }: { where: Record<string, unknown> }) =>
         state.runs.find(
           (r) =>
-            state.visible(r) &&
             r.workflowEnrollmentId === where.workflowEnrollmentId &&
             (where.trigger === undefined || r.trigger === where.trigger),
         ) ?? null,
@@ -219,7 +181,6 @@ vi.mock('@/lib/db/prisma', () => {
         }
         const run = {
           id: state.nextId,
-          organizationId: data.organizationId as string,
           workflowId: data.workflowId as string,
           workflowEnrollmentId: enrollmentId,
           leadId,
@@ -235,8 +196,7 @@ vi.mock('@/lib/db/prisma', () => {
       findFirst: async ({ where }: { where: Record<string, unknown> }) => {
         return (
           state.enrollments.find(
-            (e) =>
-              state.visible(e) && e.workflowId === where.workflowId && e.leadId === where.leadId,
+            (e) => e.workflowId === where.workflowId && e.leadId === where.leadId,
           ) ?? null
         )
       },
@@ -248,7 +208,6 @@ vi.mock('@/lib/db/prisma', () => {
         }
         const enrollment = {
           id: state.nextId,
-          organizationId: data.organizationId as string,
           workflowId,
           leadId,
           trigger: data.trigger as string,
@@ -259,11 +218,13 @@ vi.mock('@/lib/db/prisma', () => {
     },
   }
 
-  return { prisma: { $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(tx) } }
+  return {
+    prisma: {
+      ...tx,
+      $transaction: async (fn: (client: unknown) => Promise<unknown>) => fn(tx),
+    },
+  }
 })
-
-const ACME = 'org_acme'
-const GLOBEX = 'org_globex'
 
 async function importService() {
   vi.resetModules()
@@ -291,14 +252,13 @@ describe('Automatic workflow enrollment service', () => {
   it('2. a Website Form lead is captured and an enrollment is created', async () => {
     const { captureAutomaticLead } = await importService()
 
-    const result = await captureAutomaticLead(ACME, {
+    const result = await captureAutomaticLead({
       name: 'Jane Prospect',
       email: 'jane@prospect.test',
       source: 'WEBSITE_FORM',
     })
 
     expect(result.leadWasCreated).toBe(true)
-    expect(result.lead.organizationId).toBe(ACME)
     expect(result.enrollment).not.toBeNull()
     expect(result.enrollment?.workflowId).toBeDefined()
     expect(state.enrollments).toHaveLength(1)
@@ -308,7 +268,7 @@ describe('Automatic workflow enrollment service', () => {
   it('3. a Manual lead is captured but never enrolled', async () => {
     const { captureAutomaticLead } = await importService()
 
-    const result = await captureAutomaticLead(ACME, {
+    const result = await captureAutomaticLead({
       name: 'Manual Entry',
       email: 'manual@prospect.test',
       source: 'MANUAL',
@@ -321,7 +281,7 @@ describe('Automatic workflow enrollment service', () => {
   it('4. a CSV Import lead is captured but never enrolled', async () => {
     const { captureAutomaticLead } = await importService()
 
-    const result = await captureAutomaticLead(ACME, {
+    const result = await captureAutomaticLead({
       name: 'CSV Entry',
       email: 'csv@prospect.test',
       source: 'CSV_IMPORT',
@@ -338,13 +298,12 @@ describe('Automatic workflow enrollment service', () => {
     // once provisioning (or an earlier enrollment) has created it.
     state.workflows.push({
       id: 'wf_acme_1',
-      organizationId: ACME,
       type: 'LEAD_QUALIFICATION',
       status: 'PAUSED',
       version: 1,
     })
 
-    const result = await captureAutomaticLead(ACME, {
+    const result = await captureAutomaticLead({
       name: 'Paused Org Lead',
       email: 'paused@prospect.test',
       source: 'WEBSITE_FORM',
@@ -360,13 +319,12 @@ describe('Automatic workflow enrollment service', () => {
 
     state.workflows.push({
       id: 'wf_acme_1',
-      organizationId: ACME,
       type: 'LEAD_QUALIFICATION',
       status: 'PAUSED',
       version: 1,
     })
 
-    const firstAttempt = await captureAutomaticLead(ACME, {
+    const firstAttempt = await captureAutomaticLead({
       name: 'Skipped While Paused',
       email: 'skipped@prospect.test',
       source: 'WEBSITE_FORM',
@@ -383,7 +341,7 @@ describe('Automatic workflow enrollment service', () => {
     // A brand new capture for a DIFFERENT lead after reactivation does
     // enroll normally, proving the workflow itself still works — it's only
     // the earlier, already-captured lead that is never revisited.
-    const secondLead = await captureAutomaticLead(ACME, {
+    const secondLead = await captureAutomaticLead({
       name: 'Arrives After Reactivation',
       email: 'after-reactivation@prospect.test',
       source: 'WEBSITE_FORM',
@@ -397,7 +355,7 @@ describe('Automatic workflow enrollment service', () => {
     it('persists the message the prospect wrote', async () => {
       const { captureAutomaticLead } = await importService()
 
-      const result = await captureAutomaticLead(ACME, {
+      const result = await captureAutomaticLead({
         name: 'Intent Prospect',
         email: 'intent@prospect.test',
         formMessage: '  We need this before Q1. Budget approved.  ',
@@ -410,7 +368,7 @@ describe('Automatic workflow enrollment service', () => {
     it('stores an empty message as null, not as a blank string', async () => {
       const { captureAutomaticLead } = await importService()
 
-      const result = await captureAutomaticLead(ACME, {
+      const result = await captureAutomaticLead({
         name: 'Blank Prospect',
         email: 'blank@prospect.test',
         formMessage: '   ',
@@ -425,7 +383,7 @@ describe('Automatic workflow enrollment service', () => {
     it('stores null when the form collected no message field at all', async () => {
       const { captureAutomaticLead } = await importService()
 
-      const result = await captureAutomaticLead(ACME, {
+      const result = await captureAutomaticLead({
         name: 'Silent Prospect',
         email: 'silent@prospect.test',
         source: 'WEBSITE_FORM',
@@ -438,7 +396,7 @@ describe('Automatic workflow enrollment service', () => {
       const { captureAutomaticLead } = await importService()
 
       await expect(
-        captureAutomaticLead(ACME, {
+        captureAutomaticLead({
           name: 'Verbose Prospect',
           email: 'verbose@prospect.test',
           formMessage: 'x'.repeat(5001),
@@ -450,7 +408,7 @@ describe('Automatic workflow enrollment service', () => {
     it('accepts a message exactly at the cap', async () => {
       const { captureAutomaticLead } = await importService()
 
-      const result = await captureAutomaticLead(ACME, {
+      const result = await captureAutomaticLead({
         name: 'Exact Prospect',
         email: 'exact@prospect.test',
         formMessage: 'x'.repeat(5000),
@@ -463,13 +421,13 @@ describe('Automatic workflow enrollment service', () => {
     it('lets the latest message win on a re-submission', async () => {
       const { captureAutomaticLead } = await importService()
 
-      await captureAutomaticLead(ACME, {
+      await captureAutomaticLead({
         name: 'Returning Prospect',
         email: 'returning@prospect.test',
         formMessage: 'Just browsing for now.',
         source: 'WEBSITE_FORM',
       })
-      const second = await captureAutomaticLead(ACME, {
+      const second = await captureAutomaticLead({
         name: 'Returning Prospect',
         email: 'returning@prospect.test',
         formMessage: 'Budget approved, we need this in Q1.',
@@ -482,13 +440,13 @@ describe('Automatic workflow enrollment service', () => {
     it('never erases an existing message when the new payload omits one', async () => {
       const { captureAutomaticLead } = await importService()
 
-      await captureAutomaticLead(ACME, {
+      await captureAutomaticLead({
         name: 'Kept Prospect',
         email: 'kept@prospect.test',
         formMessage: 'Please send pricing.',
         source: 'WEBSITE_FORM',
       })
-      const second = await captureAutomaticLead(ACME, {
+      const second = await captureAutomaticLead({
         name: 'Kept Prospect',
         email: 'kept@prospect.test',
         source: 'WEBSITE_FORM',
@@ -500,13 +458,13 @@ describe('Automatic workflow enrollment service', () => {
     it('creates no second run when a re-submission brings a new message', async () => {
       const { captureAutomaticLead } = await importService()
 
-      const first = await captureAutomaticLead(ACME, {
+      const first = await captureAutomaticLead({
         name: 'Rescore Prospect',
         email: 'rescore@prospect.test',
         formMessage: 'Curious.',
         source: 'WEBSITE_FORM',
       })
-      const second = await captureAutomaticLead(ACME, {
+      const second = await captureAutomaticLead({
         name: 'Rescore Prospect',
         email: 'rescore@prospect.test',
         formMessage: 'Budget approved.',
@@ -524,7 +482,7 @@ describe('Automatic workflow enrollment service', () => {
   it('7. a duplicate Website Form submission updates the existing lead — no second lead, no second enrollment', async () => {
     const { captureAutomaticLead } = await importService()
 
-    const first = await captureAutomaticLead(ACME, {
+    const first = await captureAutomaticLead({
       name: 'Jane Prospect',
       email: 'dup@prospect.test',
       company: 'Acme Corp',
@@ -532,7 +490,7 @@ describe('Automatic workflow enrollment service', () => {
     })
     expect(first.leadWasCreated).toBe(true)
 
-    const second = await captureAutomaticLead(ACME, {
+    const second = await captureAutomaticLead({
       name: 'Jane Q. Prospect',
       email: 'DUP@Prospect.test ', // same person, different case/whitespace
       phone: '+1-555-0100',
@@ -559,9 +517,9 @@ describe('Automatic workflow enrollment service', () => {
       email: 'repeat@prospect.test',
       source: 'WEBSITE_FORM' as const,
     }
-    const first = await captureAutomaticLead(ACME, input)
-    const second = await captureAutomaticLead(ACME, input)
-    const third = await captureAutomaticLead(ACME, input)
+    const first = await captureAutomaticLead(input)
+    const second = await captureAutomaticLead(input)
+    const third = await captureAutomaticLead(input)
 
     expect(state.enrollments).toHaveLength(1)
     expect(first.enrollment?.id).toBe(second.enrollment?.id)
@@ -571,7 +529,7 @@ describe('Automatic workflow enrollment service', () => {
   it('9. a lead with no owner still enrolls successfully', async () => {
     const { captureAutomaticLead } = await importService()
 
-    const result = await captureAutomaticLead(ACME, {
+    const result = await captureAutomaticLead({
       name: 'No Owner',
       email: 'no-owner@prospect.test',
       source: 'WEBSITE_FORM',
@@ -581,72 +539,50 @@ describe('Automatic workflow enrollment service', () => {
     expect(result.enrollment).not.toBeNull()
   })
 
-  it('10. two organizations independently capture and enroll the same email — no cross-tenant leakage', async () => {
+  it('10. the same email captured twice yields one lead and one enrollment', async () => {
     const { captureAutomaticLead } = await importService()
 
-    const acmeResult = await captureAutomaticLead(ACME, {
-      name: 'Shared Email Acme',
+    const first = await captureAutomaticLead({
+      name: 'Shared Email',
       email: 'shared@prospect.test',
       source: 'WEBSITE_FORM',
     })
-    const globexResult = await captureAutomaticLead(GLOBEX, {
-      name: 'Shared Email Globex',
+    const second = await captureAutomaticLead({
+      name: 'Shared Email Again',
       email: 'shared@prospect.test',
       source: 'WEBSITE_FORM',
     })
 
-    // Each org got its own Lead and its own enrollment — the Globex capture
-    // never found (and so never "duplicate-updated") Acme's lead.
-    expect(acmeResult.lead.id).not.toBe(globexResult.lead.id)
-    expect(acmeResult.leadWasCreated).toBe(true)
-    expect(globexResult.leadWasCreated).toBe(true)
-    expect(acmeResult.enrollment?.organizationId).toBe(ACME)
-    expect(globexResult.enrollment?.organizationId).toBe(GLOBEX)
-    expect(acmeResult.enrollment?.workflowId).not.toBe(globexResult.enrollment?.workflowId)
-    expect(state.leads).toHaveLength(2)
-    expect(state.enrollments).toHaveLength(2)
-  })
-
-  it('11. fails closed with an empty organizationId (no tenant context)', async () => {
-    const { captureAutomaticLead } = await importService()
-
-    await expect(
-      captureAutomaticLead('', {
-        name: 'No Org',
-        email: 'no-org@prospect.test',
-        source: 'WEBSITE_FORM',
-      }),
-    ).rejects.toThrow()
-
-    expect(state.leads).toHaveLength(0)
-    expect(state.enrollments).toHaveLength(0)
+    expect(first.lead.id).toBe(second.lead.id)
+    expect(first.leadWasCreated).toBe(true)
+    expect(second.leadWasCreated).toBe(false)
+    expect(state.leads).toHaveLength(1)
+    expect(state.enrollments).toHaveLength(1)
   })
 
   it('rejects invalid capture input (validation)', async () => {
     const { captureAutomaticLead } = await importService()
 
     await expect(
-      captureAutomaticLead(ACME, { name: '', email: 'not-an-email', source: 'WEBSITE_FORM' }),
+      captureAutomaticLead({ name: '', email: 'not-an-email', source: 'WEBSITE_FORM' }),
     ).rejects.toMatchObject({ code: 'VALIDATION_FAILED' })
   })
 
-  it('does not create multiple LEAD_QUALIFICATION workflows for one organization across two captures', async () => {
+  it('does not create multiple LEAD_QUALIFICATION workflows across two captures', async () => {
     const { captureAutomaticLead } = await importService()
 
-    await captureAutomaticLead(ACME, {
+    await captureAutomaticLead({
       name: 'One',
       email: 'one@prospect.test',
       source: 'WEBSITE_FORM',
     })
-    await captureAutomaticLead(ACME, {
+    await captureAutomaticLead({
       name: 'Two',
       email: 'two@prospect.test',
       source: 'WEBSITE_FORM',
     })
 
-    expect(
-      state.workflows.filter((w) => w.organizationId === ACME && w.type === 'LEAD_QUALIFICATION'),
-    ).toHaveLength(1)
+    expect(state.workflows.filter((w) => w.type === 'LEAD_QUALIFICATION')).toHaveLength(1)
   })
 
   // -------------------------------------------------------------------------
@@ -657,7 +593,7 @@ describe('Automatic workflow enrollment service', () => {
     it('creates a PENDING run copying the workflow version, then emits after commit', async () => {
       const { captureAutomaticLead } = await importService()
 
-      const result = await captureAutomaticLead(ACME, {
+      const result = await captureAutomaticLead({
         name: 'Jane Prospect',
         email: 'run@prospect.test',
         source: 'WEBSITE_FORM',
@@ -673,7 +609,6 @@ describe('Automatic workflow enrollment service', () => {
       expect(emitRunRequestedMock).toHaveBeenCalledTimes(1)
       expect(emitRunRequestedMock).toHaveBeenCalledWith({
         runId: result.run?.id,
-        organizationId: ACME,
         leadId: result.lead.id,
         trigger: 'AUTOMATIC',
       })
@@ -686,7 +621,6 @@ describe('Automatic workflow enrollment service', () => {
       // uniqueness constraint, so the whole transaction rolls back.
       state.leads.push({
         id: 'lead_soft_deleted',
-        organizationId: ACME,
         name: 'Gone',
         email: 'rollback@prospect.test',
         company: null,
@@ -698,7 +632,7 @@ describe('Automatic workflow enrollment service', () => {
       })
 
       await expect(
-        captureAutomaticLead(ACME, {
+        captureAutomaticLead({
           name: 'Jane',
           email: 'rollback@prospect.test',
           source: 'WEBSITE_FORM',
@@ -717,8 +651,8 @@ describe('Automatic workflow enrollment service', () => {
         source: 'WEBSITE_FORM' as const,
       }
 
-      const first = await captureAutomaticLead(ACME, input)
-      const second = await captureAutomaticLead(ACME, { ...input, name: 'Jane Q. Prospect' })
+      const first = await captureAutomaticLead(input)
+      const second = await captureAutomaticLead({ ...input, name: 'Jane Q. Prospect' })
 
       expect(first.run).not.toBeNull()
       expect(second.run).toBeNull()
@@ -729,7 +663,7 @@ describe('Automatic workflow enrollment service', () => {
     it('creates no run for an ineligible source', async () => {
       const { captureAutomaticLead } = await importService()
 
-      const result = await captureAutomaticLead(ACME, {
+      const result = await captureAutomaticLead({
         name: 'Manual Entry',
         email: 'manual-run@prospect.test',
         source: 'MANUAL',
@@ -744,13 +678,12 @@ describe('Automatic workflow enrollment service', () => {
       const { captureAutomaticLead } = await importService()
       state.workflows.push({
         id: 'wf_paused',
-        organizationId: ACME,
         type: 'LEAD_QUALIFICATION',
         status: 'PAUSED',
         version: 1,
       })
 
-      const result = await captureAutomaticLead(ACME, {
+      const result = await captureAutomaticLead({
         name: 'Paused',
         email: 'paused-run@prospect.test',
         source: 'WEBSITE_FORM',
@@ -765,7 +698,7 @@ describe('Automatic workflow enrollment service', () => {
       const { captureAutomaticLead } = await importService()
       emitRunRequestedMock.mockRejectedValueOnce(new Error('inngest unreachable'))
 
-      const result = await captureAutomaticLead(ACME, {
+      const result = await captureAutomaticLead({
         name: 'Orphan',
         email: 'orphan@prospect.test',
         source: 'WEBSITE_FORM',

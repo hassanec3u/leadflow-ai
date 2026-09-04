@@ -4,34 +4,30 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
  * Phase 2E-2 — POST /api/webhooks/lead-capture.
  *
  * The route is exercised for real: its own module is imported and its POST
- * handler invoked with a genuine `Request`. Only its two collaborators are
- * doubled — the tenant lookup (whose real behaviour against PostgreSQL is
- * proven in tests/integration/form-capture-tenant-auth.test.ts) and
+ * handler invoked with a genuine `Request`. Two collaborators are doubled —
+ * the validated environment (which supplies FORM_CAPTURE_SECRET) and
  * `captureAutomaticLead` (proven in tests/unit/automation-enrollment.test.ts).
  *
  * Doubling `captureAutomaticLead` is what lets these tests assert the ROUTE's
- * contract — that the service is called, with the right tenant and the right
- * input — rather than re-testing the service's own rules through it.
+ * contract — that the service is called with the right input — rather than
+ * re-testing the service's own rules through it.
  */
 
 const state = vi.hoisted(() => ({
-  /** Secret -> organizationId, standing in for the SECURITY DEFINER lookup. */
-  secrets: new Map<string, string>(),
-  captureCalls: [] as { organizationId: string; input: Record<string, unknown> }[],
+  /** What the server has configured as FORM_CAPTURE_SECRET; null means unset. */
+  configuredSecret: null as string | null,
+  captureCalls: [] as Record<string, unknown>[],
   captureImpl: null as null | (() => Promise<unknown>),
   logs: [] as { level: string; message: string; context: unknown }[],
 }))
 
-vi.mock('@/lib/auth/form-capture-lookup', () => ({
-  resolveOrganizationIdFromFormCaptureSecret: async (secret: string | null | undefined) => {
-    if (typeof secret !== 'string' || secret.trim() === '') return null
-    return state.secrets.get(secret.trim()) ?? null
-  },
+vi.mock('@/lib/env', () => ({
+  getEnv: () => ({ FORM_CAPTURE_SECRET: state.configuredSecret ?? undefined }),
 }))
 
 vi.mock('@/lib/services/automation-enrollment', () => ({
-  captureAutomaticLead: async (organizationId: string, input: unknown) => {
-    state.captureCalls.push({ organizationId, input: input as Record<string, unknown> })
+  captureAutomaticLead: async (input: unknown) => {
+    state.captureCalls.push(input as Record<string, unknown>)
     if (state.captureImpl) return state.captureImpl()
     return { lead: { id: 'lead_1' }, leadWasCreated: true, enrollment: { id: 'enr_1' }, run: null }
   },
@@ -48,8 +44,8 @@ vi.mock('@/lib/logger', () => ({
   },
 }))
 
-const ACME_SECRET = 'lfwf_acme_fixture_secret'
-const GLOBEX_SECRET = 'lfwf_globex_fixture_secret'
+// 32+ characters: what the env schema requires, and what CSPRNG output looks like.
+const CONFIGURED_SECRET = 'lfwf_fixture_secret_0123456789abcdef'
 
 const VALID_BODY = {
   name: 'Jane Prospect',
@@ -65,7 +61,7 @@ async function post(
   const { POST } = await import('@/app/api/webhooks/lead-capture/route')
 
   const headers = new Headers({ 'content-type': 'application/json' })
-  const secret = options.secret === undefined ? ACME_SECRET : options.secret
+  const secret = options.secret === undefined ? CONFIGURED_SECRET : options.secret
   if (secret !== null) {
     if (options.header === 'custom') headers.set('x-leadflow-capture-secret', secret)
     else headers.set('authorization', `Bearer ${secret}`)
@@ -88,10 +84,7 @@ beforeEach(async () => {
   const { resetRateLimitsForTests } = await import('@/lib/api/rate-limit')
   resetRateLimitsForTests()
 
-  state.secrets = new Map([
-    [ACME_SECRET, 'org_acme'],
-    [GLOBEX_SECRET, 'org_globex'],
-  ])
+  state.configuredSecret = CONFIGURED_SECRET
   state.captureCalls = []
   state.captureImpl = null
   state.logs = []
@@ -105,24 +98,23 @@ describe('successful capture', () => {
     expect(response.body).toEqual({ status: 'accepted' })
   })
 
-  it('calls the real captureAutomaticLead service with the resolved tenant', async () => {
+  it('calls the captureAutomaticLead service exactly once', async () => {
     await post(VALID_BODY)
 
     expect(state.captureCalls).toHaveLength(1)
-    expect(state.captureCalls[0]?.organizationId).toBe('org_acme')
   })
 
   it('accepts the secret via the X-LeadFlow-Capture-Secret header too', async () => {
     const response = await post(VALID_BODY, { header: 'custom' })
 
     expect(response.status).toBe(202)
-    expect(state.captureCalls[0]?.organizationId).toBe('org_acme')
+    expect(state.captureCalls).toHaveLength(1)
   })
 
   it('passes the lead fields through untouched, leaving normalisation to the service', async () => {
     await post(VALID_BODY)
 
-    expect(state.captureCalls[0]?.input).toEqual({
+    expect(state.captureCalls[0]).toEqual({
       name: 'Jane Prospect',
       // Not normalised here on purpose: emailSchema (.trim().toLowerCase())
       // inside the service is the single normalisation point, so the route
@@ -144,11 +136,10 @@ describe('successful capture', () => {
     const response = await post(VALID_BODY)
 
     // An anonymous caller must not be able to probe which emails are already
-    // leads in a given organization.
+    // leads in the CRM.
     expect(response.body).toEqual({ status: 'accepted' })
     expect(response.raw).not.toContain('leadWasCreated')
     expect(response.raw).not.toContain('lead_1')
-    expect(response.raw).not.toContain('org_acme')
   })
 })
 
@@ -156,14 +147,14 @@ describe('source is server-forced', () => {
   it('forces WEBSITE_FORM when the client sends nothing', async () => {
     await post(VALID_BODY)
 
-    expect(state.captureCalls[0]?.input.source).toBe('WEBSITE_FORM')
+    expect(state.captureCalls[0]?.source).toBe('WEBSITE_FORM')
   })
 
   it('accepts a client-sent WEBSITE_FORM', async () => {
     const response = await post({ ...VALID_BODY, source: 'WEBSITE_FORM' })
 
     expect(response.status).toBe(202)
-    expect(state.captureCalls[0]?.input.source).toBe('WEBSITE_FORM')
+    expect(state.captureCalls[0]?.source).toBe('WEBSITE_FORM')
   })
 
   it.each(['CSV_IMPORT', 'MANUAL', 'REFERRAL'])(
@@ -172,29 +163,22 @@ describe('source is server-forced', () => {
       await post({ ...VALID_BODY, source })
 
       // Otherwise a crafted submission could dodge the eligibility rule.
-      expect(state.captureCalls[0]?.input.source).toBe('WEBSITE_FORM')
+      expect(state.captureCalls[0]?.source).toBe('WEBSITE_FORM')
     },
   )
 })
 
-describe('the payload can never choose the tenant or the workflow', () => {
-  it('ignores organizationId in the body — the secret decides', async () => {
-    await post({ ...VALID_BODY, organizationId: 'org_globex' })
-
-    expect(state.captureCalls[0]?.organizationId).toBe('org_acme')
-    expect(state.captureCalls[0]?.input).not.toHaveProperty('organizationId')
-  })
-
+describe('the payload can never choose where the lead lands', () => {
   it('ignores workflowId in the body', async () => {
     await post({ ...VALID_BODY, workflowId: 'wf_attacker' })
 
-    expect(state.captureCalls[0]?.input).not.toHaveProperty('workflowId')
+    expect(state.captureCalls[0]).not.toHaveProperty('workflowId')
   })
 
   it('ignores ownerId and arbitrary metadata', async () => {
     await post({ ...VALID_BODY, ownerId: 'user_x', aiScore: 100, metadata: { a: 1 } })
 
-    const input = state.captureCalls[0]?.input ?? {}
+    const input = state.captureCalls[0] ?? {}
     expect(Object.keys(input).sort()).toEqual([
       'company',
       'email',
@@ -204,21 +188,13 @@ describe('the payload can never choose the tenant or the workflow', () => {
       'source',
     ])
   })
-
-  it("never lets organization A's secret act on organization B", async () => {
-    await post({ ...VALID_BODY, organizationId: 'org_acme' }, { secret: GLOBEX_SECRET })
-
-    expect(state.captureCalls[0]?.organizationId).toBe('org_globex')
-  })
 })
 
 describe('form message', () => {
   it('passes the prospect message through to the service', async () => {
     await post({ ...VALID_BODY, formMessage: 'We need this before Q1. Budget approved.' })
 
-    expect(state.captureCalls[0]?.input.formMessage).toBe(
-      'We need this before Q1. Budget approved.',
-    )
+    expect(state.captureCalls[0]?.formMessage).toBe('We need this before Q1. Budget approved.')
   })
 
   it('accepts a submission with no message at all', async () => {
@@ -227,7 +203,7 @@ describe('form message', () => {
     expect(response.status).toBe(202)
     // Absent, not empty string — "did not fill it in" must reach the model
     // as null so it can judge the absence rather than read a blank as an answer.
-    expect(state.captureCalls[0]?.input.formMessage).toBeUndefined()
+    expect(state.captureCalls[0]?.formMessage).toBeUndefined()
   })
 
   it('rejects a message over the 5000-character cap with a 422', async () => {
@@ -258,24 +234,25 @@ describe('authentication', () => {
     expect(state.captureCalls).toHaveLength(0)
   })
 
-  it('refuses an unknown secret', async () => {
+  it('refuses a wrong secret', async () => {
     const response = await post(VALID_BODY, { secret: 'lfwf_not_a_real_secret' })
 
     expect(response.status).toBe(401)
     expect(state.captureCalls).toHaveLength(0)
   })
 
-  it('gives byte-identical responses for missing, unknown and revoked secrets', async () => {
+  it('gives byte-identical responses for missing, wrong and unconfigured secrets', async () => {
     const missing = await post(VALID_BODY, { secret: null, ip: '203.0.113.1' })
-    const unknown = await post(VALID_BODY, { secret: 'lfwf_nope', ip: '203.0.113.2' })
+    const wrong = await post(VALID_BODY, { secret: 'lfwf_nope', ip: '203.0.113.2' })
 
-    state.secrets.delete(ACME_SECRET) // rotated away
-    const revoked = await post(VALID_BODY, { secret: ACME_SECRET, ip: '203.0.113.3' })
+    state.configuredSecret = null // the server has none configured at all
+    const unconfigured = await post(VALID_BODY, { secret: CONFIGURED_SECRET, ip: '203.0.113.3' })
 
-    // No oracle: an attacker cannot tell these three apart.
+    // No oracle: an attacker cannot tell these three apart, and in particular
+    // cannot learn that the endpoint is unconfigured.
     expect(missing.status).toBe(401)
-    expect(unknown.raw).toBe(missing.raw)
-    expect(revoked.raw).toBe(missing.raw)
+    expect(wrong.raw).toBe(missing.raw)
+    expect(unconfigured.raw).toBe(missing.raw)
   })
 
   it('refuses an empty bearer value', async () => {
@@ -352,9 +329,9 @@ describe('rate limiting', () => {
     const { checkRateLimit, resetRateLimitsForTests } = await import('@/lib/api/rate-limit')
     resetRateLimitsForTests()
 
-    // Buckets are caller-supplied opaque keys; the route passes an IP and an
-    // organization id, never a credential. Proven by construction here.
-    const result = checkRateLimit('lead-capture:org:org_acme', { limit: 1, windowMs: 1000 })
+    // Buckets are caller-supplied opaque keys; the route passes an IP and a
+    // fixed label, never a credential. Proven by construction here.
+    const result = checkRateLimit('lead-capture:authenticated', { limit: 1, windowMs: 1000 })
     expect(result.allowed).toBe(true)
   })
 })
@@ -421,7 +398,7 @@ describe('internal errors and leakage', () => {
     const ok = await post(VALID_BODY)
     const unauthorized = await post(VALID_BODY, { secret: 'lfwf_bad', ip: '198.51.100.9' })
 
-    expect(ok.raw).not.toContain(ACME_SECRET)
+    expect(ok.raw).not.toContain(CONFIGURED_SECRET)
     expect(unauthorized.raw).not.toContain('lfwf_bad')
   })
 
@@ -434,7 +411,7 @@ describe('internal errors and leakage', () => {
     await post(VALID_BODY, { ip: '198.51.100.7' })
 
     const serialized = JSON.stringify(state.logs)
-    expect(serialized).not.toContain(ACME_SECRET)
+    expect(serialized).not.toContain(CONFIGURED_SECRET)
     expect(serialized).not.toContain('lfwf_bad')
     expect(serialized).not.toContain('Jane@Example.COM')
     expect(serialized).not.toContain('+33123456789')

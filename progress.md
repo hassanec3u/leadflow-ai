@@ -1,8 +1,8 @@
 # LeadFlow AI — Progress Log
 
-Last updated: 2026-09-01
+Last updated: 2026-09-04
 
-## Status: Phase 0 and Phase 1 (Core Lead Management) complete, verified end-to-end against real PostgreSQL
+## Status: Phase 0 and Phase 1 complete; Phase 2 in progress. **The product is now SINGLE-TENANT** (multi-tenancy removed 2026-09-04 — see the log entry and `docs/architecture.md` §4).
 
 Phase 0 — Foundations is implemented. The application builds, starts, serves its routes, and passes typecheck, lint, Prisma validation and 67 tests. Real PostgreSQL authentication was verified end-to-end: Signup → Login → Authenticated Dashboard → Logout → Protected route blocked. A session/tenant bug was found and fixed in `lib/auth/session.ts` during this verification.
 
@@ -30,11 +30,11 @@ Phase 1.1 — Lead business-rules closure is implemented: ownership is now optio
 | Application starts              | ✅     | `npm run build` + `npm start` verified; routes return expected status codes        |
 | Clean Next.js architecture      | ✅     | Next.js 16.3.4 App Router, route groups `(app)` / `(auth)`, business logic in `lib/` |
 | Authentication                  | ✅     | Auth.js v5 + Prisma adapter, Credentials provider, JWT sessions                    |
-| Organizations                   | ✅     | `Organization` model, auto-created at signup with unique slug                      |
+| Organizations                   | ➖     | Removed 2026-09-04 — the product is single-tenant                                 |
 | Users and roles                 | ✅     | `User` + `Role` enum (ADMIN / MANAGER / SALES_REP)                                 |
 | PostgreSQL + Prisma             | ✅     | Prisma 7 + `@prisma/adapter-pg`; schema validates, migrations generated            |
-| Multi-tenant isolation          | ✅     | Session-derived org, `withTenant()`, never trusts client-supplied org id           |
-| PostgreSQL RLS                  | ✅     | Policies with `FORCE ROW LEVEL SECURITY`, verified against real Postgres           |
+| Multi-tenant isolation          | ➖     | Removed 2026-09-04 — nothing to isolate with one tenant                           |
+| PostgreSQL RLS                  | ➖     | Removed 2026-09-04 with multi-tenancy                                             |
 | Environment variable validation | ✅     | Zod, fail-fast, optional integrations genuinely optional                           |
 | Application shell               | ✅     | Dark sidebar + light content, per the product reference                            |
 | Sidebar/navigation              | ✅     | 7 destinations, capability-filtered                                                |
@@ -78,17 +78,29 @@ Phase 1.1 — Lead business-rules closure is implemented: ownership is now optio
 4. **No CI pipeline is configured.** `npm run verify` runs the whole gate locally; wiring it to a CI provider is deployment work not requested here.
 5. ~~`tests.json`'s `leads-5` describes upsert-on-duplicate...~~ **Resolved in Phase 1.1**: `docs/product-spec.md` §5 now explicitly documents reject-on-duplicate (exact normalized-email match, `ConflictError`) as the decided MVP behavior; `leads-5` is marked superseded in `tests.json`, `leads-20` covers the decided behavior.
 6. **No automated browser-level E2E test runner exists.** The Phase 1 E2E pass (create/search/detail/edit/delete/CSV import/tenant isolation, all against real PostgreSQL) was done manually via browser automation on 2026-09-01 and is not a repeatable CI-run suite — same gap as `auth-1` in Phase 0.
-7. **Pre-existing, unrelated test failures**: `tests/integration/session-tenancy.test.ts` (5 tests) and `tests/integration/auth-lookup-security-definer.test.ts` (6 tests) fail as of this update. Confirmed unrelated to any Lead work — they touch only `lib/auth/config.ts`/`lib/auth/session.ts`/the PGlite auth-lookup role, none of which Phase 1 touched. Not fixed, per scope discipline (out of the Leads task); needs its own investigation.
-8. **Owner filter in the Leads UI is derived from a broad, unfiltered `listLeads` call** (no dedicated "list org members" endpoint exists) — only owners with at least one non-deleted lead appear, capped at 100 leads. A known, minor limitation, not a bug.
+7. ~~**Pre-existing, unrelated test failures** in `session-tenancy.test.ts` and `auth-lookup-security-definer.test.ts`~~ — **Resolved 2026-09-04**: both files tested multi-tenancy and were deleted with it. The suite is green.
+8. **Owner filter in the Leads UI is derived from a broad, unfiltered `listLeads` call** (no dedicated "list users" endpoint exists) — only owners with at least one non-deleted lead appear, capped at 100 leads. A known, minor limitation, not a bug.
 
-## Deployment requirements discovered in Phase 0
+## Deployment requirements
 
-Two constraints that **silently void RLS** if ignored — both now documented in `docs/architecture.md` §4:
-
-1. The application's database role must **not** be a superuser and must **not** hold `BYPASSRLS`. PostgreSQL superusers bypass RLS entirely. This was caught by the test suite: the first run of the isolation tests passed queries that should have been blocked, purely because the connection was the bootstrap superuser.
+1. ~~The application's database role must not hold `BYPASSRLS`~~ — moot since 2026-09-04: there is no RLS. A non-superuser role is still good hygiene.
 2. `AUTH_URL` must be set for any self-hosted, internet-facing deployment, because the app sets Auth.js `trustHost: true` (required outside Vercel — without it every auth request fails with `UntrustedHost`).
 
 ## Log
+
+- **2026-09-04** — **Multi-tenancy removed. The product is now single-tenant** (one company per deployment), a deliberate product decision. `docs/architecture.md` §4 records the full inventory; the shape of it:
+
+  - **Schema**: `Organization` dropped; `organizationId` dropped from `User`, `Lead`, `Workflow`, `WorkflowEnrollment`, `WorkflowRun`, `QualificationConfigVersion`. The composite uniques collapsed and each changed meaning — `Lead.email` is globally unique, exactly one `Workflow` row per type, one global `QualificationConfigVersion.version` sequence.
+  - **Database**: the ten migrations were squashed into `prisma/migrations/0_init` (no deployed data to preserve). All RLS is gone — policies, `FORCE ROW LEVEL SECURITY`, `current_org_id()` — and with it **all four `SECURITY DEFINER` roles** (`auth_lookup`, `form_capture`, `automation_recovery`, `running_recovery`) plus the privileged one-time provisioning step every deployment needed. Those four existed ONLY to escape RLS for queries that necessarily run before a tenant is known; they are ordinary queries now. `prisma/manual/` is deleted.
+  - **Runtime**: `lib/db/tenant.ts` (`withTenant`) deleted, along with `lib/auth/auth-lookup.ts`, `lib/auth/form-capture-lookup.ts`, `lib/services/organization-form-capture.ts` and `lib/services/signup.ts`. **`withTenant()` opened a transaction as a side effect**, and several services depended on that atomicity without saying so — every multi-statement sequence was audited and given an explicit `prisma.$transaction()`. This was the main correctness risk of the change.
+  - **Auth**: no public sign-up. The `/signup` route and its action are gone; accounts are provisioned with `npm run db:seed` (`prisma/seed.ts`), so a role is always set deliberately. A known gap closed as a side effect: the JWT re-hydration branch in `lib/auth/config.ts` carried a documented "KNOWN GAP" because it read through the unscoped client and RLS returned nothing — it now works.
+  - **Capture endpoint**: the per-org hashed capture secret became a deployment-wide `FORM_CAPTURE_SECRET` env var, compared in constant time (SHA-256 both sides, then `timingSafeEqual`). Unset means the endpoint authenticates nobody and rejects everything — indistinguishable to a caller from a wrong secret.
+
+  **What now enforces access control**, since the database no longer does: the RBAC checks in `lib/auth/session.ts`, and the Lead ownership filter in `lib/services/leads.ts`. That filter used to have RLS underneath it as a backstop for a forgotten `WHERE`; it now stands alone, and `claude.md` says so.
+
+  **Verification**: typecheck, lint and `prisma validate` clean; **515 tests passing, 0 failing**. The baseline before this work was 630 passing / 11 failing — the 11 failures were in `session-tenancy.test.ts` and `auth-lookup-security-definer.test.ts`, both of which this change deletes, and the drop in total is ~115 tests that existed only to prove tenant isolation. Not yet run: `npm run build`, and no check against a live database.
+
+  **Coverage genuinely lost, not replaced**: the two `SECURITY DEFINER` recovery functions had integration tests asserting their exact column grants and read-only-ness. Those are gone with the functions. The RUNNING-orphan staleness SQL kept integration coverage (`tests/integration/automation-execution.test.ts`) by exercising the query directly, but that test now mirrors the service's SQL rather than calling the same database object — a drift risk worth knowing about.
 
 - **2026-09-01** — Repository inspected: empty except a blank `claude.md`. Produced `docs/product-spec.md`, `docs/architecture.md`, `docs/roadmap.md`, `progress.md`, `tests.json` from the LeadFlow AI dashboard screenshot. Key assumptions (multi-tenant SaaS, Next.js/TS/Postgres stack) recorded in `docs/product-spec.md` §2.
 

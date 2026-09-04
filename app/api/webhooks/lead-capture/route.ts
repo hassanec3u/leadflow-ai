@@ -1,8 +1,10 @@
+import { createHash, timingSafeEqual } from 'node:crypto'
+
 import { NextResponse } from 'next/server'
 
 import { withApiErrorHandling } from '@/lib/api/handler'
 import { checkRateLimit, pruneRateLimitWindows } from '@/lib/api/rate-limit'
-import { resolveOrganizationIdFromFormCaptureSecret } from '@/lib/auth/form-capture-lookup'
+import { getEnv } from '@/lib/env'
 import { AppError, UnauthenticatedError, ValidationError } from '@/lib/errors'
 import { captureAutomaticLead } from '@/lib/services/automation-enrollment'
 
@@ -11,28 +13,30 @@ import { captureAutomaticLead } from '@/lib/services/automation-enrollment'
  *
  *   POST /api/webhooks/lead-capture
  *
- * The production entry point the whole Phase 2 automation chain was missing:
- * form submission -> tenant authentication -> captureAutomaticLead() ->
- * WorkflowEnrollment -> PENDING WorkflowRun -> automation/run.requested ->
- * Inngest -> engine. The path is the one docs/architecture.md §6 specifies.
+ * The production entry point of the Phase 2 automation chain: form submission
+ * -> authentication -> captureAutomaticLead() -> WorkflowEnrollment ->
+ * PENDING WorkflowRun -> automation/run.requested -> Inngest -> engine. The
+ * path is the one docs/architecture.md §6 specifies.
  *
  * Deliberately thin. Every business rule — email normalisation, duplicate
  * merge, workflow lookup, PAUSED handling, enrollment uniqueness, the PENDING
  * run, emitting after commit — stays in `captureAutomaticLead()` and is not
  * reimplemented, re-checked or second-guessed here. This file does four
- * things: rate limit, authenticate the tenant, validate input, delegate.
+ * things: rate limit, authenticate, validate input, delegate.
  *
  * =============================================================================
  * WHY THIS ENDPOINT IS SAFE TO EXPOSE ANONYMOUSLY
  * =============================================================================
- * It never reads an organization identifier from the request. The tenant is
- * resolved exclusively from a per-organization capture secret, through
- * `resolveOrganizationIdFromFormCaptureSecret()` (Phase 2E-1), which looks the
- * secret up by hash via a narrow SECURITY DEFINER function. `organizationId`,
- * `slug`, `workflowId` and `ownerId` in the body are not merely rejected as
- * authority — they are never read at all (see `buildCaptureInput`). Postgres
- * RLS remains the second barrier: everything after resolution runs inside
- * `withTenant()` within the service.
+ * It is guarded by a shared secret (FORM_CAPTURE_SECRET) compared in constant
+ * time, and it never reads an identifier from the request body that could
+ * redirect where the lead lands: `workflowId` and `ownerId` are not merely
+ * rejected as authority — they are never read at all (see `buildCaptureInput`).
+ *
+ * While the product was multi-tenant this endpoint additionally had to RESOLVE
+ * which tenant a submission belonged to, which is why the secret lived hashed
+ * on a table and was looked up through a SECURITY DEFINER function. There is
+ * one tenant now, so the secret only has to authenticate — it identifies
+ * nothing — and an environment variable is the right home for it.
  */
 
 /** No Auth.js, no session, no cookies — this route is anonymous by design. */
@@ -46,19 +50,36 @@ const IP_LIMIT = 30
 const IP_WINDOW_MS = 60_000
 
 /**
- * Per-organization, applied AFTER resolution. A valid credential still cannot
- * run up an unbounded enrichment/OpenAI bill (architecture.md §132).
+ * Applied AFTER authentication. A valid credential still cannot run up an
+ * unbounded enrichment/OpenAI bill (architecture.md §132). One secret serves
+ * the whole deployment, so this bucket is global rather than per-caller —
+ * which is what makes it a spend ceiling.
  */
-const ORG_LIMIT = 120
-const ORG_WINDOW_MS = 60_000
+const AUTHENTICATED_LIMIT = 120
+const AUTHENTICATED_WINDOW_MS = 60_000
 
 /**
- * Identical response for every authentication failure — absent secret, unknown
- * secret, rotated-away secret, soft-deleted organization. The endpoint must
- * not be usable as an oracle for which secrets or organizations exist.
+ * Identical response for every authentication failure — absent secret, wrong
+ * secret, or no secret configured on the server at all. The endpoint must not
+ * be usable as an oracle for how it is configured.
  */
 function authenticationFailed(): never {
   throw new UnauthenticatedError('Invalid capture credentials.')
+}
+
+/**
+ * Constant-time secret comparison.
+ *
+ * Both sides are SHA-256'd first so that `timingSafeEqual` always receives two
+ * equal-length (32-byte) buffers — it throws on a length mismatch, and feeding
+ * it raw inputs would both crash on a short guess and leak the expected length
+ * through that crash. Digesting normalises length without weakening anything:
+ * the comparison is still over the full value.
+ */
+function secretMatches(presented: string, expected: string): boolean {
+  const a = createHash('sha256').update(presented, 'utf8').digest()
+  const b = createHash('sha256').update(expected, 'utf8').digest()
+  return timingSafeEqual(a, b)
 }
 
 function rateLimited(retryAfterSeconds: number): never {
@@ -92,7 +113,7 @@ function readSecret(request: Request): string | null {
  * NOTE: `x-forwarded-for` is client-controlled unless a trusted proxy
  * overwrites it, so this bucket is spoofable in a deployment that terminates
  * traffic without one. It is a cost-abuse speed bump, not an access control —
- * the per-organization limit below is the one that binds an authenticated
+ * the post-authentication limit below is the one that binds an authenticated
  * caller.
  */
 function clientBucket(request: Request): string {
@@ -106,9 +127,8 @@ function clientBucket(request: Request): string {
  * source.
  *
  * Building the object explicitly — rather than passing the parsed body
- * through — is what makes `organizationId`, `workflowId`, `ownerId` and any
- * other field structurally incapable of reaching the service: they are never
- * copied. `source` is set here, after the client's value is discarded, so a
+ * through — is what makes `workflowId`, `ownerId` and any other field
+ * structurally incapable of reaching the service: they are never copied. `source` is set here, after the client's value is discarded, so a
  * submission claiming MANUAL or CSV_IMPORT cannot dodge the automatic
  * enrollment eligibility rule (docs/product-spec.md §8).
  */
@@ -136,19 +156,19 @@ export const POST = withApiErrorHandling(async (request: Request): Promise<NextR
   })
   if (!ipLimit.allowed) rateLimited(ipLimit.retryAfterSeconds)
 
-  // 2. Resolve the tenant from the credential alone — never from the payload.
+  // 2. Authenticate on the credential alone — never on anything in the payload.
   const secret = readSecret(request)
-  if (!secret) authenticationFailed()
+  const expected = getEnv().FORM_CAPTURE_SECRET
+  // No secret configured => nobody can authenticate. The safe direction, and
+  // indistinguishable from a wrong secret to the caller.
+  if (!secret || !expected || !secretMatches(secret, expected)) authenticationFailed()
 
-  const organizationId = await resolveOrganizationIdFromFormCaptureSecret(secret)
-  if (!organizationId) authenticationFailed()
-
-  // 3. Now that a tenant is known, bound what one credential can cost.
-  const orgLimit = checkRateLimit(`lead-capture:org:${organizationId}`, {
-    limit: ORG_LIMIT,
-    windowMs: ORG_WINDOW_MS,
+  // 3. Bound what an authenticated caller can cost.
+  const spendLimit = checkRateLimit('lead-capture:authenticated', {
+    limit: AUTHENTICATED_LIMIT,
+    windowMs: AUTHENTICATED_WINDOW_MS,
   })
-  if (!orgLimit.allowed) rateLimited(orgLimit.retryAfterSeconds)
+  if (!spendLimit.allowed) rateLimited(spendLimit.retryAfterSeconds)
 
   // 4. Parse. A malformed body is a client error, not a 500.
   let body: unknown
@@ -163,14 +183,14 @@ export const POST = withApiErrorHandling(async (request: Request): Promise<NextR
 
   // 5. Delegate. The service validates with `automaticLeadCaptureSchema` and
   //    owns every business rule; nothing above duplicated any of it.
-  await captureAutomaticLead(organizationId, buildCaptureInput(body as Record<string, unknown>))
+  await captureAutomaticLead(buildCaptureInput(body as Record<string, unknown>))
 
   // 202: the lead is recorded, but qualification runs asynchronously through
   // Inngest, so the work is accepted rather than complete.
   //
   // The body is deliberately bare. Reporting whether the lead was newly
   // created, or whether it enrolled, would turn this anonymous endpoint into
-  // an oracle telling an attacker which email addresses already exist in a
-  // given organization's CRM. Acceptance is all a form needs to know.
+  // an oracle telling an attacker which email addresses already exist in the
+  // CRM. Acceptance is all a form needs to know.
   return NextResponse.json({ status: 'accepted' }, { status: 202 })
 })

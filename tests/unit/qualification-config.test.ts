@@ -1,21 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 /**
- * Per-organization qualification configuration.
+ * Qualification configuration.
  *
- * `@/lib/db/prisma` is an in-memory fake mimicking Prisma plus Postgres RLS —
- * a row is visible only when its `organizationId` matches whatever the last
- * `withTenant()` established — so a service that forgot tenant scoping shows
- * up here as cross-tenant leakage. Real RLS on the table is a migration
- * concern and is enforced independently.
+ * `@/lib/db/prisma` is an in-memory fake mimicking Prisma, including the
+ * `version` unique constraint the append-only save path relies on to
+ * serialise two concurrent admins.
  */
-
-const ACME = 'org_acme'
-const GLOBEX = 'org_globex'
 
 type Version = {
   id: string
-  organizationId: string
   version: number
   icp: string
   instructions: string | null
@@ -25,51 +19,34 @@ type Version = {
 }
 
 const state = vi.hoisted(() => ({
-  currentOrg: null as string | null,
   role: 'ADMIN' as 'ADMIN' | 'MANAGER' | 'SALES_REP',
-  organizationId: 'org_acme',
   versions: [] as Version[],
-  runs: [] as { id: string; organizationId: string; qualificationConfigVersionId: string | null }[],
+  runs: [] as { id: string; qualificationConfigVersionId: string | null }[],
   logs: [] as { message: string; context: unknown }[],
   seq: 0,
 }))
 
-const visible = <T extends { organizationId: string }>(rows: T[]) =>
-  rows.filter((row) => row.organizationId === state.currentOrg)
-
 const txClient = {
-  $executeRaw: async (_s: TemplateStringsArray, ...values: unknown[]) => {
-    state.currentOrg = (values[0] as string) ?? null
-    return 1
-  },
   qualificationConfigVersion: {
     findFirst: async ({ where }: { where?: Record<string, unknown> } = {}) => {
-      const rows = visible(state.versions)
-        .filter(
-          (row) =>
-            (where?.id === undefined || row.id === where.id) &&
-            (where?.organizationId === undefined || row.organizationId === where.organizationId),
-        )
+      const rows = state.versions
+        .filter((row) => where?.id === undefined || row.id === where.id)
         .sort((a, b) => b.version - a.version)
       return rows[0] ?? null
     },
     create: async ({ data }: { data: Record<string, unknown> }) => {
-      const organizationId = data.organizationId as string
       const version = data.version as number
-      if (
-        state.versions.some((v) => v.organizationId === organizationId && v.version === version)
-      ) {
+      if (state.versions.some((v) => v.version === version)) {
         const { Prisma } = await import('@prisma/client')
         throw new Prisma.PrismaClientKnownRequestError('Unique constraint', {
           code: 'P2002',
           clientVersion: 'test',
-          meta: { target: ['organizationId', 'version'] },
+          meta: { target: ['version'] },
         })
       }
       state.seq += 1
       const row: Version = {
         id: `cfg_${state.seq}`,
-        organizationId,
         version,
         icp: data.icp as string,
         instructions: (data.instructions as string | null) ?? null,
@@ -83,7 +60,7 @@ const txClient = {
   },
   workflowRun: {
     findFirst: async ({ where }: { where: Record<string, unknown> }) =>
-      visible(state.runs).find((r) => r.id === where.id) ?? null,
+      state.runs.find((r) => r.id === where.id) ?? null,
     updateMany: async ({
       where,
       data,
@@ -91,7 +68,7 @@ const txClient = {
       where: Record<string, unknown>
       data: Record<string, unknown>
     }) => {
-      const run = visible(state.runs).find((r) => r.id === where.id)
+      const run = state.runs.find((r) => r.id === where.id)
       if (!run) return { count: 0 }
       Object.assign(run, data)
       return { count: 1 }
@@ -100,20 +77,22 @@ const txClient = {
 }
 
 vi.mock('@/lib/db/prisma', () => ({
-  prisma: { $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(txClient) },
+  prisma: {
+    ...txClient,
+    $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(txClient),
+  },
 }))
 
 vi.mock('@/lib/auth/session', () => ({
   requireUser: async () => ({
     id: 'user_1',
-    organizationId: state.organizationId,
     role: state.role,
   }),
   requireCapability: async (capability: string) => {
     const { hasCapability } = await import('@/lib/auth/rbac')
     const { ForbiddenError } = await import('@/lib/errors')
     if (!hasCapability(state.role, capability as never)) throw new ForbiddenError()
-    return { id: 'user_1', organizationId: state.organizationId, role: state.role }
+    return { id: 'user_1', role: state.role }
   },
 }))
 
@@ -131,14 +110,9 @@ const runService = () => import('@/lib/services/workflow-runs')
 const VALID = { icp: 'Mid-market B2B SaaS in Europe.', instructions: null, threshold: 80 }
 
 beforeEach(() => {
-  state.currentOrg = null
   state.role = 'ADMIN'
-  state.organizationId = ACME
   state.versions = []
-  state.runs = [
-    { id: 'run_acme', organizationId: ACME, qualificationConfigVersionId: null },
-    { id: 'run_globex', organizationId: GLOBEX, qualificationConfigVersionId: null },
-  ]
+  state.runs = [{ id: 'run_acme', qualificationConfigVersionId: null }]
   state.logs = []
   state.seq = 0
 })
@@ -233,31 +207,11 @@ describe('append-only versioning', () => {
   })
 })
 
-describe('tenant isolation', () => {
-  it('never returns another organization’s configuration', async () => {
-    const { saveQualificationConfig, getQualificationConfig } = await service()
-    await saveQualificationConfig(VALID)
-
-    state.organizationId = GLOBEX
-    expect(await getQualificationConfig()).toMatchObject({ version: 0, isCustomised: false })
-  })
-
-  it('starts version numbering independently per organization', async () => {
-    const { saveQualificationConfig } = await service()
-    await saveQualificationConfig(VALID)
-
-    state.organizationId = GLOBEX
-    expect(await saveQualificationConfig({ ...VALID, icp: 'Globex ICP.' })).toMatchObject({
-      version: 1,
-    })
-  })
-})
-
 describe('pinning a config to a run', () => {
   it('falls back to the defaults and pins nothing when none was ever saved', async () => {
     const { pinQualificationConfigForRun } = await runService()
 
-    const pinned = await pinQualificationConfigForRun(ACME, 'run_acme')
+    const pinned = await pinQualificationConfigForRun('run_acme')
     expect(pinned).toMatchObject({ versionId: null, version: 0, threshold: 70 })
     // Nothing to point at — inventing a version would record a decision the
     // admin never made.
@@ -269,7 +223,7 @@ describe('pinning a config to a run', () => {
     await saveQualificationConfig(VALID)
     const { pinQualificationConfigForRun } = await runService()
 
-    const pinned = await pinQualificationConfigForRun(ACME, 'run_acme')
+    const pinned = await pinQualificationConfigForRun('run_acme')
     expect(pinned).toMatchObject({ version: 1, threshold: 80 })
     expect(state.runs[0]?.qualificationConfigVersionId).toBe(pinned.versionId)
   })
@@ -279,27 +233,28 @@ describe('pinning a config to a run', () => {
     const { pinQualificationConfigForRun } = await runService()
 
     await saveQualificationConfig(VALID)
-    const first = await pinQualificationConfigForRun(ACME, 'run_acme')
+    const first = await pinQualificationConfigForRun('run_acme')
 
     await saveQualificationConfig({ ...VALID, threshold: 10, icp: 'Rewritten ICP.' })
 
     // Re-reading (an Inngest replay) must reach the SAME verdict, so the run
     // keeps the config it was judged against — never the current one.
-    const again = await pinQualificationConfigForRun(ACME, 'run_acme')
+    const again = await pinQualificationConfigForRun('run_acme')
     expect(again.versionId).toBe(first.versionId)
     expect(again.threshold).toBe(80)
     expect(again.icp).toBe(VALID.icp)
   })
 
-  it('does not pin another tenant’s config onto a run', async () => {
+  it('reports not-found as "nothing pinned" for an unknown run', async () => {
     const { saveQualificationConfig } = await service()
     await saveQualificationConfig(VALID)
 
     const { pinQualificationConfigForRun } = await runService()
-    // Globex has no config of its own and cannot see Acme's.
-    expect(await pinQualificationConfigForRun(GLOBEX, 'run_globex')).toMatchObject({
-      versionId: null,
-      threshold: 70,
+    // The run does not exist, so there is nothing to pin the version onto —
+    // the caller still gets a usable config back rather than an error.
+    expect(await pinQualificationConfigForRun('run_missing')).toMatchObject({
+      version: 1,
+      threshold: 80,
     })
   })
 })

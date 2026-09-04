@@ -35,7 +35,7 @@ const lead: LeadFacts = {
   source: 'WEBSITE_FORM',
 }
 
-const call = (idempotencyKey: string) => ({ idempotencyKey, organizationId: 'org_1' })
+const call = (idempotencyKey: string) => ({ idempotencyKey })
 
 describe('MockEnrichmentProvider', () => {
   it('returns a deterministic structured result on success', async () => {
@@ -94,7 +94,7 @@ describe('MockEnrichmentProvider', () => {
     await provider.enrich({ ...call('step_2'), lead })
 
     expect(provider.calls).toHaveLength(2)
-    expect(provider.calls[0]).toMatchObject({ idempotencyKey: 'step_1', organizationId: 'org_1' })
+    expect(provider.calls[0]).toMatchObject({ idempotencyKey: 'step_1' })
     expect(provider.calls[1]?.idempotencyKey).toBe('step_2')
   })
 })
@@ -212,13 +212,13 @@ describe('MockNotificationProvider', () => {
 describe('MockAiBudgetGuard', () => {
   it('resolves when not exceeded', async () => {
     const guard = new MockAiBudgetGuard()
-    await expect(guard.assertWithinBudget('org_1')).resolves.toBeUndefined()
-    expect(guard.calls).toEqual([{ organizationId: 'org_1' }])
+    await expect(guard.assertWithinBudget()).resolves.toBeUndefined()
+    expect(guard.calls).toHaveLength(1)
   })
 
   it('throws a non-retriable ProviderCallError when exceeded', async () => {
     const guard = new MockAiBudgetGuard({ exceeded: true })
-    const promise = guard.assertWithinBudget('org_1')
+    const promise = guard.assertWithinBudget()
     await expect(promise).rejects.toBeInstanceOf(ProviderCallError)
     await promise.catch((error: unknown) => {
       expect(error).toBeInstanceOf(ProviderCallError)

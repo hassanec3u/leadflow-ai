@@ -17,7 +17,7 @@ import { auth } from '@/lib/auth/config'
  * for every data path.
  */
 
-const PUBLIC_ROUTES = new Set(['/', '/login', '/signup'])
+const PUBLIC_ROUTES = new Set(['/', '/login'])
 
 export default auth((request) => {
   const { pathname } = request.nextUrl
@@ -58,8 +58,8 @@ export default auth((request) => {
  *
  * Neither route becomes unauthenticated — each keeps its own, stronger
  * mechanism:
- *   - /api/webhooks/lead-capture verifies a per-organization capture secret
- *     and resolves the tenant from it (lib/auth/form-capture-lookup.ts);
+ *   - /api/webhooks/lead-capture verifies the application's capture secret
+ *     (FORM_CAPTURE_SECRET) in constant time;
  *   - /api/inngest verifies Inngest's request signature via INNGEST_SIGNING_KEY.
  *
  * Listed one path at a time on purpose. A blanket `api` exclusion would also

@@ -12,8 +12,8 @@ import {
  *
  * Thin by design, like app/(app)/leads/actions.ts: the service validates, the
  * service authorises (ADMIN via `integrations:manage`), and this only maps a
- * failure to a client-safe message. `organizationId` never appears here — it
- * comes from the session inside the service.
+ * failure to a client-safe message. The caller is resolved from the session
+ * inside the service.
  */
 export type SaveQualificationConfigResult =
   | { ok: true; data: QualificationConfigView }

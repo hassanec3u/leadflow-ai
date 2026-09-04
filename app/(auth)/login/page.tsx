@@ -1,5 +1,3 @@
-import Link from 'next/link'
-
 import { signInAction } from '@/app/(auth)/actions'
 import { AuthForm } from '@/components/auth/auth-form'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -39,10 +37,7 @@ export default async function LoginPage(props: PageProps<'/login'>) {
           ]}
         />
         <p className="text-muted-foreground text-center text-sm">
-          Don&apos;t have an account?{' '}
-          <Link href="/signup" className="text-primary font-medium hover:underline">
-            Create one
-          </Link>
+          Accounts are created by an administrator. Contact yours if you need access.
         </p>
       </CardContent>
     </Card>

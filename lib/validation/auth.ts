@@ -31,36 +31,17 @@ export const credentialsSignInSchema = z.object({
   password: z.string().min(1, 'Password is required'),
 })
 
-export const signUpSchema = z.object({
+/**
+ * Shape of an operator-provisioned account (prisma/seed.ts). There is no public
+ * sign-up: accounts are created deliberately, so `role` is an explicit input
+ * rather than something defaulted into by whoever registers first.
+ */
+export const createUserSchema = z.object({
   name: z.string().min(1, 'Your name is required').max(120),
   email: emailSchema,
   password: passwordSchema,
-  organizationName: z
-    .string()
-    .min(1, 'Organization name is required')
-    .max(120, 'Organization name is too long'),
+  role: z.enum(['ADMIN', 'MANAGER', 'SALES_REP']),
 })
 
-export type SignUpInput = z.infer<typeof signUpSchema>
+export type CreateUserInput = z.infer<typeof createUserSchema>
 export type CredentialsSignInInput = z.infer<typeof credentialsSignInSchema>
-
-/**
- * Derive a URL-safe organization slug.
- *
- * Exported (and unit-tested) rather than inlined because slug collisions are a
- * real failure mode at signup and the rules deserve to be pinned by tests.
- */
-export function slugifyOrganizationName(name: string): string {
-  const base = name
-    .normalize('NFKD')
-    // Strip diacritics so "Café" and "Cafe" produce the same readable slug.
-    .replace(/[̀-ͯ]/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 48)
-
-  // A name consisting entirely of non-latin characters can slugify to empty;
-  // fall back so the unique constraint is never asked to store "".
-  return base || 'org'
-}

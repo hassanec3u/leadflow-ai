@@ -54,6 +54,24 @@ const serverEnvSchema = z.object({
   INNGEST_EVENT_KEY: z.string().min(1).optional(),
   INNGEST_SIGNING_KEY: z.string().min(1).optional(),
 
+  /**
+   * Shared secret authenticating the public Website Form capture endpoint
+   * (`POST /api/webhooks/lead-capture`).
+   *
+   * Optional so the app boots without it, but the consequence is deliberate and
+   * safe: with no secret configured the endpoint can authenticate nobody and
+   * rejects every request. That mirrors the behaviour this replaced, where an
+   * organization that had never been issued a capture secret simply could not
+   * be resolved by a submission.
+   *
+   * Minimum 32 characters because the intended value is CSPRNG output, not a
+   * chosen password — generate with `openssl rand -hex 32`.
+   */
+  FORM_CAPTURE_SECRET: z
+    .string()
+    .min(32, 'FORM_CAPTURE_SECRET must be at least 32 characters')
+    .optional(),
+
   // --- Optional integrations (Phase 3-5). Absent => feature simply off. ----
   OPENAI_API_KEY: z.string().min(1).optional(),
   /**

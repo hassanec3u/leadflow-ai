@@ -13,16 +13,14 @@ import { requestManualRerun, type RunForExecution } from '@/lib/services/workflo
  * `automation/run.requested` emit — already lives in `requestManualRerun`
  * (lib/services/workflow-runs.ts) and is exercised there against the fake DB
  * (tests/unit/automation-engine.test.ts, "24."/"25."). This function's only
- * job is the one thing that module explicitly delegates to its caller: resolve
- * WHO is calling and WHICH organization they belong to from the session —
- * never from a client-supplied value — and enforce `automation:manage`
- * (ADMIN + MANAGER, docs/product-spec.md §11) before calling it. Postgres RLS
- * (`withTenant` inside `requestManualRerun`) remains the second barrier
- * underneath, exactly as everywhere else.
+ * job is the one thing that module explicitly delegates to its caller:
+ * enforce `automation:manage` (ADMIN + MANAGER, docs/product-spec.md §11)
+ * against the session before calling it. `requestManualRerun` is deliberately
+ * session-free and cannot perform that check itself.
  */
 export async function requestManualRerunForCurrentUser(
   sourceRunId: string,
 ): Promise<RunForExecution> {
-  const user = await requireCapability('automation:manage')
-  return requestManualRerun(user.organizationId, sourceRunId)
+  await requireCapability('automation:manage')
+  return requestManualRerun(sourceRunId)
 }

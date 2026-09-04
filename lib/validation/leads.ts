@@ -7,10 +7,9 @@ import { z } from 'zod'
  * plain data/validation, safe to import from a future client form.
  *
  * Deliberately excluded from every schema here: `status`, `aiScore`,
- * `qualification`, `deletedAt`, `organizationId`. Per docs/product-spec.md §5
- * these are either derived (status — recomputed from WorkflowRunStep/
- * EmailEvent, never hand-set), AI-only (aiScore/qualification — Phase 3), or
- * session-derived (organizationId — never client input), or have their own
+ * `qualification`, `deletedAt`. Per docs/product-spec.md §5 these are either
+ * derived (status — recomputed from WorkflowRunStep/EmailEvent, never
+ * hand-set), AI-only (aiScore/qualification — Phase 3), or have their own
  * dedicated operation (deletedAt — see `deleteLead`).
  */
 
@@ -81,8 +80,7 @@ export const nameSchema = z.string().min(1, 'Name is required').max(200, 'Name i
  * Normalized BEFORE the format/length checks run (trim, then lowercase) —
  * not after — so that " John@Example.COM " both passes `.email()` (which
  * would otherwise reject the surrounding whitespace) and normalizes to
- * exactly what the tenant-scoped `(organizationId, email)` uniqueness
- * constraint compares against. Applied uniformly to create, update, and CSV
+ * exactly what the `email` uniqueness constraint compares against. Applied uniformly to create, update, and CSV
  * import, since all three route through this same schema (Phase 1.1
  * business-rules closure). Syntactic validation only — no mailbox/domain
  * existence checks, no canonicalization beyond trim+lowercase.

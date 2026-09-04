@@ -28,7 +28,7 @@ const lead: LeadFacts = {
   source: 'WEBSITE_FORM',
 }
 
-const call = { idempotencyKey: 'step_1', organizationId: 'org_1' }
+const call = { idempotencyKey: 'step_1' }
 
 describe('EnrichmentData shape', () => {
   it('carries exactly the three MVP groups', () => {
@@ -125,7 +125,6 @@ describe('provider input contract', () => {
     expect(Object.keys(recorded ?? {}).sort()).toEqual([
       'idempotencyKey',
       'input',
-      'organizationId',
     ])
     expect(Object.keys(recorded?.input ?? {})).toEqual(['lead'])
   })

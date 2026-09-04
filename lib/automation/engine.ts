@@ -62,8 +62,6 @@ export type StepRunner = <T>(id: string, fn: () => Promise<T>) => Promise<T>
 
 export type ExecuteWorkflowRunInput = {
   runId: string
-  /** Claim from the event payload — verified against the run under RLS. */
-  organizationId: string
   stepRunner?: StepRunner
 }
 
@@ -117,21 +115,19 @@ export async function executeWorkflowRun(
   const sleep = deps.sleep ?? defaultSleep
   const stepRunner: StepRunner = input.stepRunner ?? ((_id, fn) => fn())
 
-  // The event's organizationId is a CLAIM. Loading the run under that tenant
-  // context is what verifies it: a mismatch matches zero rows under RLS.
-  const run = await loadRunForExecution(input.organizationId, input.runId)
+  // The run row is the authority for everything below; the event payload is
+  // only a handle. An event naming a run that does not exist aborts here.
+  const run = await loadRunForExecution(input.runId)
   if (!run) {
-    logger.warn('Automation run not visible for claimed organization; aborting', {
-      orgId: input.organizationId,
+    logger.warn('Automation run not found; aborting', {
       runId: input.runId,
     })
-    return { outcome: 'ABORTED', runStatus: null, reason: 'run_not_visible' }
+    return { outcome: 'ABORTED', runStatus: null, reason: 'run_not_found' }
   }
 
-  const claim = await claimRun(run.organizationId, run.id)
+  const claim = await claimRun(run.id)
   if (claim.outcome === 'ALREADY_TERMINAL') {
     logger.info('Automation run already terminal; nothing to execute', {
-      orgId: run.organizationId,
       runId: run.id,
       leadId: run.leadId,
       status: claim.status,
@@ -139,11 +135,10 @@ export async function executeWorkflowRun(
     return { outcome: 'ALREADY_TERMINAL', runStatus: claim.status }
   }
 
-  const lead = await loadLeadFacts(run.organizationId, run.leadId)
+  const lead = await loadLeadFacts(run.leadId)
   if (!lead) {
-    await finalizeRun(run.organizationId, run.id, 'FAILED')
+    await finalizeRun(run.id, 'FAILED')
     logger.error('Automation run has no visible lead; failing run', {
-      orgId: run.organizationId,
       runId: run.id,
       leadId: run.leadId,
     })
@@ -152,7 +147,7 @@ export async function executeWorkflowRun(
 
   // Pinned before any step runs, and idempotent: a replay returns the version
   // already attached to the run rather than re-reading current settings.
-  const config = await pinQualificationConfigForRun(run.organizationId, run.id)
+  const config = await pinQualificationConfigForRun(run.id)
 
   const state: PipelineState = {
     lead,
@@ -183,10 +178,9 @@ export async function executeWorkflowRun(
 
   const runStatus: Extract<WorkflowRunStatus, 'SUCCEEDED' | 'FAILED' | 'BLOCKED'> =
     state.terminal?.status ?? 'SUCCEEDED'
-  await finalizeRun(run.organizationId, run.id, runStatus)
+  await finalizeRun(run.id, runStatus)
 
   logger.info('Automation run finished', {
-    orgId: run.organizationId,
     runId: run.id,
     leadId: run.leadId,
     status: runStatus,
@@ -241,16 +235,15 @@ async function recordSkippedStep(
   step: WorkflowStepKind,
   reason: string,
 ): Promise<StepResult> {
-  const claim = await claimStep(run.organizationId, run.id, step)
+  const claim = await claimStep(run.id, step)
   if (claim.kind === 'memoized')
     return memoizedResult(claim.stepRun.status, claim.stepRun.output, claim.stepRun.errorCode)
 
-  await completeStep(run.organizationId, claim.stepRun.id, {
+  await completeStep(claim.stepRun.id, {
     status: 'SKIPPED',
     errorCode: reason,
   })
   logger.info('Automation step skipped', {
-    orgId: run.organizationId,
     runId: run.id,
     leadId: run.leadId,
     step,
@@ -288,7 +281,7 @@ async function runStepWithRetries(args: {
   const maxAttempts = STEP_MAX_ATTEMPTS[step]
 
   for (;;) {
-    const claim = await claimStep(run.organizationId, run.id, step)
+    const claim = await claimStep(run.id, step)
     if (claim.kind === 'memoized') {
       return memoizedResult(claim.stepRun.status, claim.stepRun.output, claim.stepRun.errorCode)
     }
@@ -304,13 +297,12 @@ async function runStepWithRetries(args: {
 
     try {
       const result = await performStep(args, stepRunId)
-      await completeStep(run.organizationId, stepRunId, {
+      await completeStep(stepRunId, {
         status: result.status,
         output: result.output ?? null,
         errorCode: result.errorCode ?? null,
       })
       logger.info('Automation step finished', {
-        orgId: run.organizationId,
         runId: run.id,
         leadId: run.leadId,
         step,
@@ -325,7 +317,6 @@ async function runStepWithRetries(args: {
       const canRetry = isRetriableProviderError(error) && attempt < maxAttempts
 
       logger.warn('Automation step attempt failed', {
-        orgId: run.organizationId,
         runId: run.id,
         leadId: run.leadId,
         step,
@@ -342,7 +333,7 @@ async function runStepWithRetries(args: {
 
       // Only the error's own message is persisted (operator-facing, on the
       // row); provider payloads and prompts are never logged or stored here.
-      await completeStep(run.organizationId, stepRunId, {
+      await completeStep(stepRunId, {
         status: 'FAILED',
         errorCode,
         errorMessage: error instanceof Error ? error.message : 'Unknown provider failure',
@@ -369,7 +360,7 @@ async function performStep(
   stepRunId: string,
 ): Promise<StepResult> {
   const { run, state, providers, step } = args
-  const call = { idempotencyKey: stepRunId, organizationId: run.organizationId }
+  const call = { idempotencyKey: stepRunId }
 
   switch (step) {
     case 'ENRICH': {
@@ -390,7 +381,7 @@ async function performStep(
       }
       // Budget is checked BEFORE the paid call; exceeding it is not something
       // a retry can fix, so the guard throws non-retriably.
-      await providers.aiBudget?.assertWithinBudget(run.organizationId)
+      await providers.aiBudget?.assertWithinBudget()
 
       const raw = await providers.ai.qualify({
         ...call,
@@ -424,7 +415,7 @@ async function performStep(
       const outcome: LeadQualificationOutcome = isQualifyingScore(ai.score, state.config.threshold)
         ? 'QUALIFIED'
         : 'UNQUALIFIED'
-      const applied = await applyAiQualification(run.organizationId, state.lead.id, {
+      const applied = await applyAiQualification(state.lead.id, {
         score: ai.score,
         outcome,
       })

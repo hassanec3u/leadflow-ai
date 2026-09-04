@@ -6,17 +6,18 @@ import { PrismaClient } from '@prisma/client'
 import { getEnv } from '@/lib/env'
 
 /**
- * Base Prisma client.
+ * The Prisma client. Single-tenant: there is no tenant context to establish,
+ * so services use this directly.
  *
- * IMPORTANT: this client carries NO tenant context. Using it directly for
- * tenant-owned data will, under RLS, match zero rows (see the RLS migration:
- * an unset `app.current_org_id` fails every policy). That is intentional —
- * forgetting tenant scoping fails closed and loudly rather than leaking data.
+ * Use `prisma.$transaction()` explicitly wherever a sequence of statements has
+ * to see one snapshot — in particular every read-then-conditional-write pair
+ * (lib/services/workflow-runs.ts, lib/services/leads.ts). Those used to
+ * inherit a transaction from the tenant helper that wrapped them; now they
+ * must ask for one.
  *
- * For tenant data use `withTenant()` from lib/db/tenant.ts instead.
- *
- * Legitimate direct uses: authentication lookups that happen before an
- * organization is known (Auth.js adapter, credential sign-in), and migrations.
+ * Access control is enforced in application code, not by the database:
+ * role/capability checks in lib/auth/session.ts, and the Lead ownership scope
+ * in lib/services/leads.ts.
  */
 
 function createPrismaClient(): PrismaClient {

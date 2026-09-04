@@ -69,29 +69,22 @@ Do not introduce a different database or ORM without explicit approval.
 
 # 4. NON-NEGOTIABLE SECURITY RULES
 
-## Tenancy
+## Single tenant
 
-The organization MUST come from the authenticated session.
+This application serves ONE company per deployment.
 
-Use:
+There is no `Organization` model, no `organizationId` column, no
+`withTenant()`, and no row level security. Do not reintroduce any of them.
 
-- `getCurrentUser()`
-- `getCurrentOrganization()`
-- `withTenant()`
+If a task seems to call for multi-tenancy, that is a product decision, not an
+implementation detail: **STOP and ask.**
 
-from the existing authentication/database helpers.
+Earlier documents (`docs/roadmap.md`, `docs/product-spec.md`, `progress.md`)
+were written while the product was multi-tenant. Where they mention
+organizations, that history no longer applies.
 
-NEVER trust an organization ID supplied by the client.
-
-Never accept `organizationId` from:
-
-- request body
-- query string
-- headers
-- route parameters
-- client-side state
-
-A client must never be able to choose the tenant it operates on.
+The identity of the caller still comes from the authenticated session, via
+`getCurrentUser()` / `requireUser()` — never from client input.
 
 ---
 
@@ -111,32 +104,29 @@ server-side.
 
 Do not rely on layouts alone for authorization.
 
+### Lead ownership is load-bearing
+
+A `SALES_REP` may only see and edit Leads they own; ADMIN/MANAGER see all.
+This is an ownership filter applied at query time in `lib/services/leads.ts`.
+
+It used to have Postgres RLS underneath it as a second barrier that caught a
+forgotten `WHERE`. That barrier is gone. **This filter now stands alone** —
+treat it as security code, and keep it covered by tests.
+
 ---
 
-## PostgreSQL RLS
+## Database access
 
-Tenant-owned tables must follow the existing RLS architecture.
+Use `prisma` from `lib/db/prisma.ts` directly.
 
-They require:
+Wrap a sequence of statements in `prisma.$transaction()` whenever they must
+see one snapshot — in particular every read-then-conditional-write pair
+(`claimRun`, `claimStep`, `applyAiQualification`, `updateLead`, ...). These
+used to inherit a transaction from the tenant helper; they must now ask for
+one explicitly. Removing a transaction here is a correctness change, not a
+cleanup.
 
-- `organizationId`
-- `ENABLE ROW LEVEL SECURITY`
-- `FORCE ROW LEVEL SECURITY`
-- policies using both `USING`
-- and `WITH CHECK`
-
-The application database role must:
-
-- NOT be a PostgreSQL superuser
-- NOT have `BYPASSRLS`
-
-Never weaken RLS merely to make a feature work.
-
-If authentication or another infrastructure concern requires a special
-pre-authentication database mechanism, use the narrowest possible
-security design and document it.
-
-Never create a generic RLS bypass.
+The application database role should not be a PostgreSQL superuser.
 
 ---
 

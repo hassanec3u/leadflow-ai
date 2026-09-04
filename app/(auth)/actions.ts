@@ -1,13 +1,12 @@
 'use server'
 
 import { AuthError } from 'next-auth'
-import { redirect, unstable_rethrow } from 'next/navigation'
+import { unstable_rethrow } from 'next/navigation'
 
 import { signIn } from '@/lib/auth/config'
-import { GENERIC_ERROR_MESSAGE, isAppError } from '@/lib/errors'
+import { GENERIC_ERROR_MESSAGE } from '@/lib/errors'
 import { logger } from '@/lib/logger'
-import { signUpNewOrganization } from '@/lib/services/signup'
-import { credentialsSignInSchema, signUpSchema } from '@/lib/validation/auth'
+import { credentialsSignInSchema } from '@/lib/validation/auth'
 
 /**
  * Server actions for authentication.
@@ -71,46 +70,4 @@ export async function signInAction(
   }
 
   return {}
-}
-
-export async function signUpAction(
-  _previous: AuthActionState,
-  formData: FormData,
-): Promise<AuthActionState> {
-  const parsed = signUpSchema.safeParse({
-    name: formData.get('name'),
-    email: formData.get('email'),
-    password: formData.get('password'),
-    organizationName: formData.get('organizationName'),
-  })
-
-  if (!parsed.success) {
-    return {
-      message: 'Check the details below.',
-      fieldErrors: parsed.error.flatten().fieldErrors as Record<string, string[]>,
-    }
-  }
-
-  try {
-    await signUpNewOrganization(parsed.data)
-
-    // Sign the new user straight in; requiring an immediate second credential
-    // entry after signup is friction with no security benefit.
-    await signIn('credentials', {
-      email: parsed.data.email,
-      password: parsed.data.password,
-      redirectTo: '/dashboard',
-    })
-  } catch (error) {
-    unstable_rethrow(error)
-
-    if (isAppError(error)) {
-      return { message: error.message }
-    }
-
-    logger.error('Unexpected sign-up failure', { error })
-    return { message: GENERIC_ERROR_MESSAGE }
-  }
-
-  redirect('/dashboard')
 }

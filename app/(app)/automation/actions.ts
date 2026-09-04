@@ -13,8 +13,8 @@ import {
  * Pipeline detail) to the workflow status service. Thin by design, like
  * app/(app)/automation/runs/actions.ts: the service authorises
  * (`automation:manage`, ADMIN + MANAGER) and enforces the transition; this
- * only maps a failure to a client-safe message. `organizationId` never
- * appears here — it comes from the session inside the service.
+ * only maps a failure to a client-safe message. The caller is resolved from
+ * the session inside the service.
  */
 export type SetWorkflowStatusActionResult =
   { ok: true; data: WorkflowStatusResult } | { ok: false; message: string }

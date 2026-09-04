@@ -2,8 +2,8 @@ import 'server-only'
 
 import bcrypt from 'bcryptjs'
 
-import { findUserForAuthentication } from '@/lib/auth/auth-lookup'
 import type { Role } from '@/lib/auth/rbac'
+import { prisma } from '@/lib/db/prisma'
 import { logger } from '@/lib/logger'
 
 /**
@@ -17,6 +17,13 @@ import { logger } from '@/lib/logger'
  * response would let an attacker enumerate registered email addresses. The
  * bcrypt compare still runs against a dummy hash when the user is absent so
  * the timing profile does not reveal existence either.
+ *
+ * This reads `users` through the ordinary Prisma client. While the product was
+ * multi-tenant it could not: `users` was under FORCE ROW LEVEL SECURITY keyed
+ * to a tenant that this very query was what established, so the lookup needed a
+ * dedicated SECURITY DEFINER function and NOLOGIN role to escape the deadlock.
+ * Single-tenant, there is no tenant to establish and no policy to escape, so
+ * that machinery is gone.
  */
 
 export type VerifiedUser = {
@@ -24,7 +31,6 @@ export type VerifiedUser = {
   email: string
   name: string | null
   image: string | null
-  organizationId: string
   role: Role
 }
 
@@ -34,7 +40,18 @@ export async function verifyCredentials(
   email: string,
   password: string,
 ): Promise<VerifiedUser | null> {
-  const user = await findUserForAuthentication(email)
+  const user = await prisma.user.findUnique({
+    where: { email },
+    select: {
+      id: true,
+      email: true,
+      name: true,
+      image: true,
+      passwordHash: true,
+      role: true,
+    },
+  })
+
   const hashToCompare = user?.passwordHash ?? DUMMY_HASH
   const passwordMatches = await bcrypt.compare(password, hashToCompare)
 
@@ -48,7 +65,6 @@ export async function verifyCredentials(
     email: user.email,
     name: user.name,
     image: user.image,
-    organizationId: user.organizationId,
     role: user.role,
   }
 }

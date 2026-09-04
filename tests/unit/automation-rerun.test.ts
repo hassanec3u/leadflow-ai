@@ -11,25 +11,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
  * conflict, the post-commit emit) — it tests the one thing this module adds:
  * resolving the caller from the session and enforcing `automation:manage`
  * before anything else runs. `@/lib/db/prisma` is an in-memory fake mimicking
- * Prisma plus Postgres RLS, same convention as
- * tests/unit/automation-enrollment.test.ts and tests/unit/automation-read.test.ts.
+ * Prisma, same convention as tests/unit/automation-enrollment.test.ts and
+ * tests/unit/automation-read.test.ts.
  */
 
-const ACME = 'org_acme'
-const GLOBEX = 'org_globex'
-
-type Row = Record<string, unknown> & { organizationId?: string }
+type Row = Record<string, unknown>
 
 const state = vi.hoisted(() => ({
-  currentOrg: null as string | null,
   role: 'ADMIN' as 'ADMIN' | 'MANAGER' | 'SALES_REP',
-  organizationId: 'org_acme',
   workflows: [] as Row[],
   runs: [] as Row[],
   nextId: 0,
 }))
-
-const visible = (row: Row) => row.organizationId === state.currentOrg
 
 vi.mock('@/lib/db/prisma', async () => {
   const { Prisma } = await import('@prisma/client')
@@ -43,17 +36,13 @@ vi.mock('@/lib/db/prisma', async () => {
   }
 
   const tx = {
-    $executeRaw: async (_s: TemplateStringsArray, ...values: unknown[]) => {
-      state.currentOrg = (values[0] as string) ?? null
-      return 1
-    },
     workflow: {
       findFirst: async ({ where }: { where: Record<string, unknown> }) =>
-        state.workflows.find((w) => visible(w) && w.id === where.id) ?? null,
+        state.workflows.find((w) => w.id === where.id) ?? null,
     },
     workflowRun: {
       findFirst: async ({ where }: { where: Record<string, unknown> }) => {
-        const found = state.runs.find((r) => visible(r) && r.id === where.id)
+        const found = state.runs.find((r) => r.id === where.id)
         return found ? { ...found } : null
       },
       create: async ({ data }: { data: Record<string, unknown> }) => {
@@ -67,7 +56,6 @@ vi.mock('@/lib/db/prisma', async () => {
         }
         const run = {
           id: `run_${state.nextId++}`,
-          organizationId: data.organizationId as string,
           workflowId: data.workflowId as string,
           workflowEnrollmentId: data.workflowEnrollmentId as string,
           leadId,
@@ -91,7 +79,7 @@ vi.mock('@/lib/auth/session', () => ({
     const { hasCapability } = await import('@/lib/auth/rbac')
     const { ForbiddenError } = await import('@/lib/errors')
     if (!hasCapability(state.role, capability as never)) throw new ForbiddenError()
-    return { id: 'user_1', organizationId: state.organizationId, role: state.role }
+    return { id: 'user_1', role: state.role }
   },
 }))
 
@@ -106,17 +94,10 @@ async function service() {
   return import('@/lib/services/automation-rerun')
 }
 
-function seedRun(options: {
-  id: string
-  organizationId: string
-  status: string
-  leadId?: string
-  enrollmentId?: string
-}) {
+function seedRun(options: { id: string; status: string; leadId?: string; enrollmentId?: string }) {
   state.runs.push({
     id: options.id,
-    organizationId: options.organizationId,
-    workflowId: `wf_${options.organizationId}`,
+    workflowId: 'wf_1',
     workflowEnrollmentId: options.enrollmentId ?? `enr_${options.id}`,
     leadId: options.leadId ?? `lead_${options.id}`,
     version: 1,
@@ -127,20 +108,15 @@ function seedRun(options: {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  state.currentOrg = null
   state.role = 'ADMIN'
-  state.organizationId = ACME
   state.nextId = 0
-  state.workflows = [
-    { id: 'wf_org_acme', organizationId: ACME, version: 1 },
-    { id: 'wf_org_globex', organizationId: GLOBEX, version: 1 },
-  ]
+  state.workflows = [{ id: 'wf_1', version: 1 }]
   state.runs = []
 })
 
 describe('requestManualRerunForCurrentUser — authorisation', () => {
   it('refuses SALES_REP', async () => {
-    seedRun({ id: 'run_1', organizationId: ACME, status: 'FAILED' })
+    seedRun({ id: 'run_1', status: 'FAILED' })
     state.role = 'SALES_REP'
     const { requestManualRerunForCurrentUser } = await service()
 
@@ -151,7 +127,7 @@ describe('requestManualRerunForCurrentUser — authorisation', () => {
   })
 
   it('allows ADMIN', async () => {
-    seedRun({ id: 'run_1', organizationId: ACME, status: 'FAILED' })
+    seedRun({ id: 'run_1', status: 'FAILED' })
     state.role = 'ADMIN'
     const { requestManualRerunForCurrentUser } = await service()
 
@@ -160,7 +136,7 @@ describe('requestManualRerunForCurrentUser — authorisation', () => {
   })
 
   it('allows MANAGER', async () => {
-    seedRun({ id: 'run_1', organizationId: ACME, status: 'FAILED' })
+    seedRun({ id: 'run_1', status: 'FAILED' })
     state.role = 'MANAGER'
     const { requestManualRerunForCurrentUser } = await service()
 
@@ -169,27 +145,13 @@ describe('requestManualRerunForCurrentUser — authorisation', () => {
   })
 })
 
-describe('requestManualRerunForCurrentUser — tenancy', () => {
-  it('takes the organization from the session, never from the caller', async () => {
-    seedRun({ id: 'run_acme', organizationId: ACME, status: 'FAILED' })
-    seedRun({ id: 'run_globex', organizationId: GLOBEX, status: 'FAILED' })
-    state.organizationId = ACME
-
-    const { requestManualRerunForCurrentUser } = await service()
-    const rerun = await requestManualRerunForCurrentUser('run_acme')
-
-    expect(rerun.organizationId).toBe(ACME)
-  })
-
-  it('cannot rerun a run belonging to another organization', async () => {
-    seedRun({ id: 'run_globex', organizationId: GLOBEX, status: 'FAILED' })
-    state.organizationId = ACME // signed in as an ACME user
+describe('requestManualRerunForCurrentUser — unknown run', () => {
+  it('reports an unknown run id as not found, creating nothing', async () => {
+    seedRun({ id: 'run_1', status: 'FAILED' })
 
     const { requestManualRerunForCurrentUser } = await service()
 
-    // Invisible under RLS from ACME's tenant context — same as an id that
-    // never existed, no cross-tenant oracle.
-    await expect(requestManualRerunForCurrentUser('run_globex')).rejects.toMatchObject({
+    await expect(requestManualRerunForCurrentUser('run_missing')).rejects.toMatchObject({
       code: 'NOT_FOUND',
     })
     expect(state.runs).toHaveLength(1)
@@ -200,7 +162,6 @@ describe('requestManualRerunForCurrentUser — new run creation', () => {
   it('creates a new MANUAL_RERUN run on the same enrollment', async () => {
     seedRun({
       id: 'run_1',
-      organizationId: ACME,
       status: 'FAILED',
       leadId: 'lead_1',
       enrollmentId: 'enr_1',
@@ -223,7 +184,6 @@ describe('requestManualRerunForCurrentUser — double-click / concurrency', () =
   it('a second concurrent rerun for the same lead is refused as a conflict, not a second run', async () => {
     seedRun({
       id: 'run_1',
-      organizationId: ACME,
       status: 'FAILED',
       leadId: 'lead_1',
       enrollmentId: 'enr_1',

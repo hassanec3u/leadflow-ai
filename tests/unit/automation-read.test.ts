@@ -3,33 +3,23 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 /**
  * Phase 2G — the Automation read services.
  *
- * `@/lib/db/prisma` is an in-memory fake mimicking Prisma plus Postgres RLS:
- * a row is visible only when its `organizationId` matches whatever the last
- * `withTenant()` established, exactly as tests/unit/automation-enrollment.test.ts
- * does. So a service that forgot tenant scoping surfaces here as cross-tenant
- * leakage. Real RLS on these tables is proven separately in
- * tests/integration/automation-domain.test.ts.
+ * `@/lib/db/prisma` is an in-memory fake mimicking Prisma, exactly as
+ * tests/unit/automation-enrollment.test.ts does. Real constraints on these
+ * tables are proven separately in tests/integration/automation-domain.test.ts.
  */
 
-const ACME = 'org_acme'
-const GLOBEX = 'org_globex'
 const NOW = new Date('2026-09-02T12:00:00.000Z')
 
-type Row = Record<string, unknown> & { organizationId?: string }
+type Row = Record<string, unknown>
 
 const state = vi.hoisted(() => ({
-  currentOrg: null as string | null,
   role: 'ADMIN' as 'ADMIN' | 'MANAGER' | 'SALES_REP',
-  organizationId: 'org_acme',
   workflows: [] as Row[],
   enrollments: [] as Row[],
   runs: [] as Row[],
   stepRuns: [] as Row[],
   leads: [] as Row[],
 }))
-
-/** RLS in miniature: only the current tenant's rows exist. */
-const visible = (rows: Row[]) => rows.filter((row) => row.organizationId === state.currentOrg)
 
 function matches(row: Row, where: Record<string, unknown> = {}): boolean {
   return Object.entries(where).every(([key, value]) => {
@@ -55,31 +45,27 @@ function hydrate(run: Row) {
 }
 
 const txClient = {
-  $executeRaw: async (_s: TemplateStringsArray, ...values: unknown[]) => {
-    state.currentOrg = (values[0] as string) ?? null
-    return 1
-  },
   workflow: {
     findFirst: async ({ where }: { where?: Record<string, unknown> }) =>
-      visible(state.workflows).find((row) => matches(row, where)) ?? null,
+      state.workflows.find((row) => matches(row, where)) ?? null,
   },
   workflowEnrollment: {
-    count: async () => visible(state.enrollments).length,
+    count: async () => state.enrollments.length,
   },
   workflowRun: {
     findFirst: async ({ where }: { where?: Record<string, unknown> }) => {
-      const found = sortDesc(visible(state.runs), 'createdAt').find((row) => matches(row, where))
+      const found = sortDesc(state.runs, 'createdAt').find((row) => matches(row, where))
       return found ? hydrate(found) : null
     },
     findMany: async ({ where }: { where?: Record<string, unknown> } = {}) =>
-      sortDesc(visible(state.runs), 'createdAt')
+      sortDesc(state.runs, 'createdAt')
         .filter((row) => matches(row, where))
         .map(hydrate),
     count: async ({ where }: { where?: Record<string, unknown> } = {}) =>
-      visible(state.runs).filter((row) => matches(row, where)).length,
+      state.runs.filter((row) => matches(row, where)).length,
     groupBy: async () => {
       const counts = new Map<string, number>()
-      for (const run of visible(state.runs)) {
+      for (const run of state.runs) {
         const status = run.status as string
         counts.set(status, (counts.get(status) ?? 0) + 1)
       }
@@ -88,12 +74,18 @@ const txClient = {
   },
   lead: {
     findFirst: async ({ where }: { where?: Record<string, unknown> }) =>
-      visible(state.leads).find((row) => matches(row, where)) ?? null,
+      state.leads.find((row) => matches(row, where)) ?? null,
   },
 }
 
 vi.mock('@/lib/db/prisma', () => ({
-  prisma: { $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(txClient) },
+  prisma: {
+    // Reachable both directly and inside a $transaction callback: the read
+    // service uses a transaction only where several counts must agree on one
+    // snapshot, and goes straight to the client otherwise.
+    ...txClient,
+    $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(txClient),
+  },
 }))
 
 vi.mock('@/lib/auth/session', () => ({
@@ -101,7 +93,7 @@ vi.mock('@/lib/auth/session', () => ({
     const { hasCapability } = await import('@/lib/auth/rbac')
     const { ForbiddenError } = await import('@/lib/errors')
     if (!hasCapability(state.role, capability as never)) throw new ForbiddenError()
-    return { id: 'user_1', organizationId: state.organizationId, role: state.role }
+    return { id: 'user_1', role: state.role }
   },
 }))
 
@@ -111,7 +103,6 @@ async function service() {
 
 function seedRun(options: {
   id: string
-  organizationId: string
   status: string
   leadId: string
   steps?: Array<{
@@ -126,8 +117,7 @@ function seedRun(options: {
 }) {
   state.runs.push({
     id: options.id,
-    organizationId: options.organizationId,
-    workflowId: `wf_${options.organizationId}`,
+    workflowId: 'wf_1',
     workflowEnrollmentId: `enr_${options.id}`,
     leadId: options.leadId,
     version: 1,
@@ -156,35 +146,20 @@ function seedRun(options: {
 }
 
 beforeEach(() => {
-  state.currentOrg = null
   state.role = 'ADMIN'
-  state.organizationId = ACME
   state.workflows = [
     {
-      id: 'wf_org_acme',
-      organizationId: ACME,
+      id: 'wf_1',
       type: 'LEAD_QUALIFICATION',
       status: 'ACTIVE',
       version: 3,
       createdAt: NOW,
     },
-    {
-      id: 'wf_org_globex',
-      organizationId: GLOBEX,
-      type: 'LEAD_QUALIFICATION',
-      status: 'PAUSED',
-      version: 1,
-      createdAt: NOW,
-    },
   ]
-  state.enrollments = [
-    { id: 'enr_a', organizationId: ACME },
-    { id: 'enr_b', organizationId: GLOBEX },
-  ]
+  state.enrollments = [{ id: 'enr_a' }]
   state.leads = [
     {
       id: 'lead_acme',
-      organizationId: ACME,
       name: 'Ada',
       email: 'ada@acme.test',
       company: 'Acme',
@@ -196,21 +171,7 @@ beforeEach(() => {
       deletedAt: null,
     },
     {
-      id: 'lead_globex',
-      organizationId: GLOBEX,
-      name: 'Bob',
-      email: 'bob@globex.test',
-      company: 'Globex',
-      formMessage: null,
-      aiScore: 20,
-      qualificationOutcome: 'UNQUALIFIED',
-      qualificationSource: 'AI',
-      qualificationUpdatedAt: NOW,
-      deletedAt: null,
-    },
-    {
       id: 'lead_deleted',
-      organizationId: ACME,
       name: 'Gone',
       email: 'gone@acme.test',
       company: null,
@@ -226,46 +187,20 @@ beforeEach(() => {
   state.stepRuns = []
 })
 
-describe('tenant isolation', () => {
-  it('never returns another organization’s runs', async () => {
-    seedRun({ id: 'run_acme', organizationId: ACME, status: 'SUCCEEDED', leadId: 'lead_acme' })
-    seedRun({
-      id: 'run_globex',
-      organizationId: GLOBEX,
-      status: 'SUCCEEDED',
-      leadId: 'lead_globex',
-    })
-
-    const { listWorkflowRuns } = await service()
-    const runs = await listWorkflowRuns(NOW)
-
-    expect(runs.map((run) => run.id)).toEqual(['run_acme'])
-  })
-
-  it('returns null for a run id belonging to another organization', async () => {
-    seedRun({
-      id: 'run_globex',
-      organizationId: GLOBEX,
-      status: 'SUCCEEDED',
-      leadId: 'lead_globex',
-    })
-
+describe('unknown ids', () => {
+  it('returns null for a run id that does not exist', async () => {
     const { getWorkflowRunDetail } = await service()
 
-    // Same result as an id that never existed — no oracle.
-    expect(await getWorkflowRunDetail('run_globex', NOW)).toBeNull()
     expect(await getWorkflowRunDetail('run_does_not_exist', NOW)).toBeNull()
   })
 
-  it('reads the caller’s own workflow, not another tenant’s', async () => {
+  it('reads the fixed workflow', async () => {
     const { getAutomationOverview } = await service()
 
-    const acme = await getAutomationOverview(NOW)
-    expect(acme.workflow).toMatchObject({ status: 'ACTIVE', version: 'v3' })
-
-    state.organizationId = GLOBEX
-    const globex = await getAutomationOverview(NOW)
-    expect(globex.workflow).toMatchObject({ status: 'PAUSED', version: 'v1' })
+    expect((await getAutomationOverview(NOW)).workflow).toMatchObject({
+      status: 'ACTIVE',
+      version: 'v3',
+    })
   })
 })
 
@@ -287,11 +222,11 @@ describe('authorisation', () => {
 
 describe('overview', () => {
   it('computes real counts and a real success rate', async () => {
-    seedRun({ id: 'r1', organizationId: ACME, status: 'SUCCEEDED', leadId: 'lead_acme' })
-    seedRun({ id: 'r2', organizationId: ACME, status: 'SUCCEEDED', leadId: 'lead_acme' })
-    seedRun({ id: 'r3', organizationId: ACME, status: 'FAILED', leadId: 'lead_acme' })
-    seedRun({ id: 'r4', organizationId: ACME, status: 'BLOCKED', leadId: 'lead_acme' })
-    seedRun({ id: 'r5', organizationId: ACME, status: 'RUNNING', leadId: 'lead_acme' })
+    seedRun({ id: 'r1', status: 'SUCCEEDED', leadId: 'lead_acme' })
+    seedRun({ id: 'r2', status: 'SUCCEEDED', leadId: 'lead_acme' })
+    seedRun({ id: 'r3', status: 'FAILED', leadId: 'lead_acme' })
+    seedRun({ id: 'r4', status: 'BLOCKED', leadId: 'lead_acme' })
+    seedRun({ id: 'r5', status: 'RUNNING', leadId: 'lead_acme' })
 
     const { getAutomationOverview } = await service()
     const { workflow, kpis } = await getAutomationOverview(NOW)
@@ -315,7 +250,7 @@ describe('overview', () => {
   })
 
   it('publishes no invented trend on any KPI', async () => {
-    seedRun({ id: 'r1', organizationId: ACME, status: 'SUCCEEDED', leadId: 'lead_acme' })
+    seedRun({ id: 'r1', status: 'SUCCEEDED', leadId: 'lead_acme' })
     const { getAutomationOverview } = await service()
 
     const { kpis } = await getAutomationOverview(NOW)
@@ -330,7 +265,7 @@ describe('overview', () => {
 
 describe('run detail and step states', () => {
   it('always returns the five fixed steps in pipeline order', async () => {
-    seedRun({ id: 'run_1', organizationId: ACME, status: 'RUNNING', leadId: 'lead_acme' })
+    seedRun({ id: 'run_1', status: 'RUNNING', leadId: 'lead_acme' })
     const { getWorkflowRunDetail } = await service()
 
     const run = await getWorkflowRunDetail('run_1', NOW)
@@ -352,7 +287,6 @@ describe('run detail and step states', () => {
     // simply is not one of the five keys the fixed view renders.
     seedRun({
       id: 'run_legacy',
-      organizationId: ACME,
       status: 'SUCCEEDED',
       leadId: 'lead_acme',
       steps: [{ step: 'ADD_TO_CRM', status: 'SUCCEEDED', output: { recordId: 'rec_1' } }],
@@ -374,7 +308,6 @@ describe('run detail and step states', () => {
   it('keeps SKIPPED distinct from FAILED and BLOCKED', async () => {
     seedRun({
       id: 'run_mixed',
-      organizationId: ACME,
       status: 'SUCCEEDED',
       leadId: 'lead_acme',
       steps: [
@@ -397,7 +330,6 @@ describe('run detail and step states', () => {
   it('surfaces BLOCKED as BLOCKED, with its reason', async () => {
     seedRun({
       id: 'run_blocked',
-      organizationId: ACME,
       status: 'BLOCKED',
       leadId: 'lead_acme',
       steps: [
@@ -415,7 +347,6 @@ describe('run detail and step states', () => {
   it('surfaces FAILED with its attempts and persisted message', async () => {
     seedRun({
       id: 'run_failed',
-      organizationId: ACME,
       status: 'FAILED',
       leadId: 'lead_acme',
       steps: [
@@ -441,7 +372,6 @@ describe('run detail and step states', () => {
   it('names the running step as the current step', async () => {
     seedRun({
       id: 'run_running',
-      organizationId: ACME,
       status: 'RUNNING',
       leadId: 'lead_acme',
       steps: [
@@ -459,7 +389,6 @@ describe('run detail and step states', () => {
   it('reports a succeeded run whose email was skipped as such', async () => {
     seedRun({
       id: 'run_unqualified',
-      organizationId: ACME,
       status: 'SUCCEEDED',
       leadId: 'lead_acme',
       steps: [{ step: 'SEND_EMAIL', status: 'SKIPPED', errorCode: 'below_threshold' }],
@@ -474,7 +403,6 @@ describe('run detail and step states', () => {
   it('derives log entries only from real step rows', async () => {
     seedRun({
       id: 'run_logs',
-      organizationId: ACME,
       status: 'SUCCEEDED',
       leadId: 'lead_acme',
       steps: [{ step: 'ENRICH', status: 'SUCCEEDED' }],
@@ -504,7 +432,6 @@ describe('AI output is surfaced, not just the score', () => {
   function seedScoredRun(id: string) {
     seedRun({
       id,
-      organizationId: ACME,
       status: 'SUCCEEDED',
       leadId: 'lead_acme',
       steps: [{ step: 'AI_QUALIFY', status: 'SUCCEEDED', output: AI_OUTPUT }],
@@ -550,7 +477,6 @@ describe('AI output is surfaced, not just the score', () => {
   it('reports no telemetry and no reasoning when the AI step never succeeded', async () => {
     seedRun({
       id: 'run_ai_failed',
-      organizationId: ACME,
       status: 'FAILED',
       leadId: 'lead_acme',
       steps: [{ step: 'AI_QUALIFY', status: 'FAILED', errorCode: 'ai_output_malformed' }],
@@ -565,7 +491,6 @@ describe('AI output is surfaced, not just the score', () => {
   it('ignores a stored output that no longer parses, rather than rendering it raw', async () => {
     seedRun({
       id: 'run_ai_legacy',
-      organizationId: ACME,
       status: 'SUCCEEDED',
       leadId: 'lead_acme',
       steps: [{ step: 'AI_QUALIFY', status: 'SUCCEEDED', output: { score: 'not-a-number' } }],
@@ -582,7 +507,7 @@ describe('AI output is surfaced, not just the score', () => {
 
 describe('form message on the run', () => {
   it('exposes the prospect message on the run view', async () => {
-    seedRun({ id: 'run_msg', organizationId: ACME, status: 'SUCCEEDED', leadId: 'lead_acme' })
+    seedRun({ id: 'run_msg', status: 'SUCCEEDED', leadId: 'lead_acme' })
     const { getWorkflowRunDetail } = await service()
 
     expect((await getWorkflowRunDetail('run_msg', NOW))?.formMessage).toBe(
@@ -591,8 +516,19 @@ describe('form message on the run', () => {
   })
 
   it('exposes null when the prospect wrote nothing', async () => {
-    state.organizationId = GLOBEX
-    seedRun({ id: 'run_none', organizationId: GLOBEX, status: 'SUCCEEDED', leadId: 'lead_globex' })
+    state.leads.push({
+      id: 'lead_silent',
+      name: 'Silent',
+      email: 'silent@acme.test',
+      company: null,
+      formMessage: null,
+      aiScore: null,
+      qualificationOutcome: null,
+      qualificationSource: null,
+      qualificationUpdatedAt: null,
+      deletedAt: null,
+    })
+    seedRun({ id: 'run_none', status: 'SUCCEEDED', leadId: 'lead_silent' })
     const { getWorkflowRunDetail } = await service()
 
     // Distinct from an empty string: nothing was stated.
@@ -600,7 +536,7 @@ describe('form message on the run', () => {
   })
 
   it('keeps the message out of the right-aligned input rows', async () => {
-    seedRun({ id: 'run_rows', organizationId: ACME, status: 'SUCCEEDED', leadId: 'lead_acme' })
+    seedRun({ id: 'run_rows', status: 'SUCCEEDED', leadId: 'lead_acme' })
     const { getWorkflowRunDetail } = await service()
     const run = await getWorkflowRunDetail('run_rows', NOW)
 
@@ -613,14 +549,12 @@ describe('lead automation status', () => {
   it('returns the latest run plus the real qualification', async () => {
     seedRun({
       id: 'old',
-      organizationId: ACME,
       status: 'FAILED',
       leadId: 'lead_acme',
       createdAt: new Date('2026-09-01T10:00:00.000Z'),
     })
     seedRun({
       id: 'latest',
-      organizationId: ACME,
       status: 'SUCCEEDED',
       leadId: 'lead_acme',
       createdAt: new Date('2026-09-02T10:00:00.000Z'),
@@ -647,8 +581,8 @@ describe('lead automation status', () => {
     expect(await getLeadAutomationStatus('lead_deleted', NOW)).toBeNull()
   })
 
-  it('does not expose a lead from another organization', async () => {
+  it('returns null for a lead id that does not exist', async () => {
     const { getLeadAutomationStatus } = await service()
-    expect(await getLeadAutomationStatus('lead_globex', NOW)).toBeNull()
+    expect(await getLeadAutomationStatus('lead_does_not_exist', NOW)).toBeNull()
   })
 })

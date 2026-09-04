@@ -5,25 +5,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
  *
  * `requireUser()` is mocked directly (who the caller is, per test) and
  * `@/lib/db/prisma` is replaced with a small in-memory fake that mimics just
- * enough of Prisma + Postgres RLS to prove the SERVICE's own logic:
+ * enough of Prisma to prove the SERVICE's own logic:
  *
- *  - tenant scoping: the fake only ever "sees" rows matching whatever
- *    organization id the last `withTenant()` call set via `$executeRaw`
- *    (mirroring `SET LOCAL app.current_org_id`) — exactly like RLS. If the
- *    service ever forgot to scope through `withTenant()`, or leaked an
- *    unscoped read, this would surface it by returning cross-tenant data.
+ *  - the OWNERSHIP scope: a SALES_REP only ever sees and edits leads they own.
+ *    Row level security is gone, so this filter is the ONLY thing scoping
+ *    reads — which is exactly why it is pinned down here in detail.
  *  - a real `Prisma.PrismaClientKnownRequestError` (P2002) for the duplicate
  *    email case, so the service's actual error-mapping code path runs.
- *
- * Real Postgres RLS itself is proven separately in
- * tests/integration/lead-rls.test.ts (Phase 1A) — this file is about the
- * service's authorization/tenancy/validation logic sitting in front of it.
  */
 
 const state = vi.hoisted(() => {
   type FakeLead = {
     id: string
-    organizationId: string
     ownerId: string | null
     name: string
     email: string
@@ -41,23 +34,16 @@ const state = vi.hoisted(() => {
   }
 
   const leads: FakeLead[] = []
-  const users = new Map<string, { id: string; organizationId: string }>()
-  let currentOrgId: string | null = null
+  const users = new Map<string, { id: string }>()
   let nextId = 1
 
   function reset() {
     leads.length = 0
     users.clear()
-    currentOrgId = null
     nextId = 1
   }
 
-  function visible(lead: FakeLead) {
-    return currentOrgId !== null && lead.organizationId === currentOrgId
-  }
-
   function matchesWhere(lead: FakeLead, where: Record<string, unknown>): boolean {
-    if (!visible(lead)) return false
     if ('id' in where && lead.id !== where.id) return false
     if (where.deletedAt === null && lead.deletedAt !== null) return false
     if ('ownerId' in where && lead.ownerId !== where.ownerId) return false
@@ -83,10 +69,6 @@ const state = vi.hoisted(() => {
     get nextId() {
       return nextId++
     },
-    setOrgContext: (id: string) => {
-      currentOrgId = id
-    },
-    getOrgContext: () => currentOrgId,
   }
 })
 
@@ -109,34 +91,28 @@ vi.mock('@/lib/db/prisma', async () => {
       clientVersion: 'test',
       meta: {
         modelName: 'Lead',
-        driverAdapterError: { cause: { constraint: { index: 'leads_organizationId_email_key' } } },
+        driverAdapterError: { cause: { constraint: { index: 'leads_email_key' } } },
       },
     })
   }
 
   const tx = {
-    $executeRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => {
-      state.setOrgContext(values[0] as string)
-      return 1
-    },
     user: {
       findUnique: async ({ where }: { where: { id: string } }) => {
         const user = state.users.get(where.id)
-        if (!user || user.organizationId !== state.getOrgContext()) return null
+        if (!user) return null
         return { id: user.id }
       },
     },
     lead: {
       create: async ({ data }: { data: Record<string, unknown> }) => {
         const email = data.email as string
-        const organizationId = data.organizationId as string
-        if (state.leads.some((l) => l.organizationId === organizationId && l.email === email)) {
+        if (state.leads.some((l) => l.email === email)) {
           throw uniqueEmailViolation()
         }
         const now = new Date()
         const lead = {
           id: `lead_${state.nextId}`,
-          organizationId,
           ownerId: (data.ownerId as string | null | undefined) ?? null,
           name: data.name as string,
           email,
@@ -188,12 +164,7 @@ vi.mock('@/lib/db/prisma', async () => {
       update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
         const lead = state.leads.find((l) => l.id === where.id)!
         if (typeof data.email === 'string' && data.email !== lead.email) {
-          if (
-            state.leads.some(
-              (l) =>
-                l.organizationId === lead.organizationId && l.email === data.email && l !== lead,
-            )
-          ) {
+          if (state.leads.some((l) => l.email === data.email && l !== lead)) {
             throw uniqueEmailViolation()
           }
         }
@@ -203,19 +174,23 @@ vi.mock('@/lib/db/prisma', async () => {
     },
   }
 
-  return { prisma: { $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(tx) } }
+  return {
+    prisma: {
+      ...tx,
+      // listLeads uses the ARRAY form (page + count in one snapshot); the
+      // write paths use the callback form. Both must work.
+      $transaction: async (arg: unknown) =>
+        Array.isArray(arg) ? Promise.all(arg) : (arg as (c: unknown) => Promise<unknown>)(tx),
+    },
+  }
 })
 
 const requireUserMock = vi.fn()
-
-const ACME = 'org_acme'
-const GLOBEX = 'org_globex'
 
 function user(
   overrides: Partial<{
     id: string
     role: 'ADMIN' | 'MANAGER' | 'SALES_REP'
-    organizationId: string
   }>,
 ) {
   return {
@@ -223,7 +198,6 @@ function user(
     email: 'user@test.dev',
     name: 'Test User',
     role: 'SALES_REP' as const,
-    organizationId: ACME,
     ...overrides,
   }
 }
@@ -231,7 +205,7 @@ function user(
 const ADMIN_ACME = user({ id: 'admin_acme', role: 'ADMIN' })
 const REP1_ACME = user({ id: 'rep1_acme', role: 'SALES_REP' })
 const REP2_ACME = user({ id: 'rep2_acme', role: 'SALES_REP' })
-const ADMIN_GLOBEX = user({ id: 'admin_globex', role: 'ADMIN', organizationId: GLOBEX })
+const ADMIN_OTHER = user({ id: 'admin_other', role: 'ADMIN' })
 
 async function importService() {
   vi.resetModules()
@@ -242,12 +216,12 @@ describe('Lead service', () => {
   beforeEach(() => {
     state.reset()
     requireUserMock.mockReset()
-    for (const u of [ADMIN_ACME, REP1_ACME, REP2_ACME, ADMIN_GLOBEX]) {
-      state.users.set(u.id, { id: u.id, organizationId: u.organizationId })
+    for (const u of [ADMIN_ACME, REP1_ACME, REP2_ACME, ADMIN_OTHER]) {
+      state.users.set(u.id, { id: u.id })
     }
   })
 
-  it('1. creates a Lead for the current tenant', async () => {
+  it('1. creates a Lead', async () => {
     requireUserMock.mockResolvedValue(ADMIN_ACME)
     const { createLead } = await importService()
 
@@ -256,8 +230,6 @@ describe('Lead service', () => {
       email: 'jane@prospect.test',
       source: 'WEBSITE_FORM',
     })
-
-    expect(lead.organizationId).toBe(ACME)
     expect(lead.ownerId).toBe(ADMIN_ACME.id)
     expect(lead.status).toBe('NEW')
     expect(lead.aiScore).toBeNull()
@@ -275,34 +247,6 @@ describe('Lead service', () => {
     const fetched = await getLead(created.id)
 
     expect(fetched.id).toBe(created.id)
-  })
-
-  it("3. does not let a tenant retrieve another tenant's Lead", async () => {
-    requireUserMock.mockResolvedValue(ADMIN_ACME)
-    const { createLead, getLead } = await importService()
-    const created = await createLead({
-      name: 'Jane',
-      email: 'jane3@prospect.test',
-      source: 'MANUAL',
-    })
-
-    requireUserMock.mockResolvedValue(ADMIN_GLOBEX)
-    await expect(getLead(created.id)).rejects.toMatchObject({ code: 'NOT_FOUND' })
-  })
-
-  it('4. update respects tenant isolation', async () => {
-    requireUserMock.mockResolvedValue(ADMIN_ACME)
-    const { createLead, updateLead } = await importService()
-    const created = await createLead({
-      name: 'Jane',
-      email: 'jane4@prospect.test',
-      source: 'MANUAL',
-    })
-
-    requireUserMock.mockResolvedValue(ADMIN_GLOBEX)
-    await expect(updateLead(created.id, { name: 'Hijacked' })).rejects.toMatchObject({
-      code: 'NOT_FOUND',
-    })
   })
 
   it('5. delete performs soft deletion, not a physical delete', async () => {
@@ -343,16 +287,6 @@ describe('Lead service', () => {
     await expect(
       createLead({ name: 'Someone Else', email: 'dup@prospect.test', source: 'MANUAL' }),
     ).rejects.toMatchObject({ code: 'CONFLICT' })
-  })
-
-  it('8. allows the same email in a different organization', async () => {
-    requireUserMock.mockResolvedValue(ADMIN_ACME)
-    const { createLead } = await importService()
-    await createLead({ name: 'Jane', email: 'shared@prospect.test', source: 'MANUAL' })
-
-    requireUserMock.mockResolvedValue(ADMIN_GLOBEX)
-    const lead = await createLead({ name: 'Jane', email: 'shared@prospect.test', source: 'MANUAL' })
-    expect(lead.organizationId).toBe(GLOBEX)
   })
 
   describe('9. SALES_REP restrictions', () => {
@@ -416,7 +350,7 @@ describe('Lead service', () => {
   })
 
   describe('11. mutations (Phase 1D)', () => {
-    it("updates a Lead's fields for the current tenant", async () => {
+    it("updates a Lead's fields", async () => {
       requireUserMock.mockResolvedValue(ADMIN_ACME)
       const { createLead, updateLead } = await importService()
       const created = await createLead({
@@ -473,23 +407,10 @@ describe('Lead service', () => {
       requireUserMock.mockResolvedValue(REP1_ACME)
       await expect(deleteLead(created.id)).rejects.toMatchObject({ code: 'NOT_FOUND' })
     })
-
-    it("does not let a tenant soft-delete another tenant's Lead", async () => {
-      requireUserMock.mockResolvedValue(ADMIN_ACME)
-      const { createLead, deleteLead } = await importService()
-      const created = await createLead({
-        name: 'Jane',
-        email: 'jane12@prospect.test',
-        source: 'MANUAL',
-      })
-
-      requireUserMock.mockResolvedValue(ADMIN_GLOBEX)
-      await expect(deleteLead(created.id)).rejects.toMatchObject({ code: 'NOT_FOUND' })
-    })
   })
 
   describe('12. importLeads (Phase 1E — CSV import)', () => {
-    it('imports every valid row for the current tenant, defaulting source to CSV_IMPORT', async () => {
+    it('imports every valid row, defaulting source to CSV_IMPORT', async () => {
       requireUserMock.mockResolvedValue(ADMIN_ACME)
       const { importLeads } = await importService()
 
@@ -501,10 +422,7 @@ describe('Lead service', () => {
       expect(result.created).toBe(2)
       expect(result.failed).toBe(0)
       expect(result.results.every((r) => r.ok)).toBe(true)
-      expect(state.leads.filter((l) => l.organizationId === ACME).map((l) => l.source)).toEqual([
-        'CSV_IMPORT',
-        'CSV_IMPORT',
-      ])
+      expect(state.leads.map((l) => l.source)).toEqual(['CSV_IMPORT', 'CSV_IMPORT'])
     })
 
     it('reports invalid rows individually without failing the whole batch', async () => {
@@ -569,17 +487,6 @@ describe('Lead service', () => {
         name: expect.any(Array),
         email: expect.any(Array),
       })
-    })
-
-    it("imports only into the caller's own organization (tenant isolation)", async () => {
-      requireUserMock.mockResolvedValue(ADMIN_ACME)
-      const { importLeads } = await importService()
-      await importLeads([{ name: 'Acme Import', email: 'acme-import@prospect.test' }])
-
-      requireUserMock.mockResolvedValue(ADMIN_GLOBEX)
-      const { listLeads } = await importService()
-      const globexView = await listLeads({})
-      expect(globexView.leads.find((l) => l.email === 'acme-import@prospect.test')).toBeUndefined()
     })
 
     it('requires an authenticated user (authorization)', async () => {
@@ -761,19 +668,21 @@ describe('Lead service', () => {
       ).rejects.toMatchObject({ code: 'CONFLICT' })
     })
 
-    it('10. the same normalized email is allowed in a different organization', async () => {
+    it('10. a differently-cased, padded duplicate of the same email is rejected', async () => {
       requireUserMock.mockResolvedValue(ADMIN_ACME)
       const { createLead } = await importService()
-      await createLead({ name: 'Jane', email: 'cross-org@prospect.test', source: 'MANUAL' })
+      await createLead({ name: 'Jane', email: 'dup-norm@prospect.test', source: 'MANUAL' })
 
-      requireUserMock.mockResolvedValue(ADMIN_GLOBEX)
-      const lead = await createLead({
-        name: 'Jane',
-        email: '  Cross-Org@Prospect.TEST  ',
-        source: 'MANUAL',
-      })
-      expect(lead.organizationId).toBe(GLOBEX)
-      expect(lead.email).toBe('cross-org@prospect.test')
+      // Normalisation happens before the uniqueness check, so casing and
+      // padding cannot smuggle a second row past it. (Email is globally unique
+      // now — there is no second organization for it to belong to.)
+      await expect(
+        createLead({
+          name: 'Jane',
+          email: '  Dup-Norm@Prospect.TEST  ',
+          source: 'MANUAL',
+        }),
+      ).rejects.toMatchObject({ code: 'CONFLICT' })
     })
 
     it('11. manual Lead creation does not trigger any workflow/outbound side effect', async () => {
@@ -966,8 +875,8 @@ describe('Lead service', () => {
         expect((await listLeads({ ownerId: ADMIN_ACME.id })).leads).toEqual([])
       })
 
-      it('never leaks another tenant when filtering', async () => {
-        requireUserMock.mockResolvedValue(ADMIN_GLOBEX)
+      it('returns nothing when a filter matches no lead', async () => {
+        requireUserMock.mockResolvedValue(ADMIN_OTHER)
         const { listLeads } = await importService()
 
         expect((await listLeads({ qualification: 'QUALIFIED' })).leads).toEqual([])

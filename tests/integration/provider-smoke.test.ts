@@ -122,7 +122,6 @@ describe.skipIf(!ENABLED)('real provider smoke test', () => {
         try {
           enrichment = await enricher.enrich({
             idempotencyKey: `smoke_step_${fixture.lead.id}`,
-            organizationId: 'smoke_org',
             lead: fixture.lead,
           })
           const c = enrichment.data.company
@@ -152,7 +151,6 @@ describe.skipIf(!ENABLED)('real provider smoke test', () => {
       try {
         const raw = await openai.qualify({
           idempotencyKey: `smoke_step_${fixture.lead.id}_ai`,
-          organizationId: 'smoke_org',
           lead: fixture.lead,
           enrichment,
           // The smoke test uses the defaults; an organization ICP is exercised

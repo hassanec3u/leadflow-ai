@@ -416,7 +416,7 @@ describe('contract compatibility', () => {
     // Accepted and honoured as part of the ProviderCall envelope; Apollo's
     // match endpoint is a read, so there is no side effect to de-duplicate.
     await expect(
-      provider.enrich({ idempotencyKey: 'step_42', organizationId: 'org_1', lead }),
+      provider.enrich({ idempotencyKey: 'step_42', lead }),
     ).resolves.toHaveProperty('provider', 'apollo')
   })
 })

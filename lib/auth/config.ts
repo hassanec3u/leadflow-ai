@@ -15,8 +15,10 @@ import { credentialsSignInSchema } from '@/lib/validation/auth'
  * Authoritative checks still happen server-side in the DAL (lib/auth/session.ts),
  * which is where authorization decisions are actually made.
  *
- * The JWT carries organizationId and role so that tenant context is derived
- * from the signed session and never from client input.
+ * The JWT carries `role` as a cache for the optimistic proxy check. It is never
+ * the basis of an authorization decision: lib/auth/session.ts re-reads the role
+ * from the database on every request, so a token issued before a role change
+ * cannot keep conferring stale privileges.
  */
 
 // Session/JWT type augmentation lives in types/next-auth.d.ts.
@@ -55,46 +57,29 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           return null
         }
 
-        // The pre-authentication lookup inside verifyCredentials() is the one
-        // deliberate, narrowly-scoped exception to users' tenant RLS policy —
-        // see lib/auth/auth-lookup.ts for the full security rationale.
         return verifyCredentials(parsed.data.email, parsed.data.password)
       },
     }),
   ],
   callbacks: {
     /**
-     * Persist tenant identity into the token at sign-in. On later requests the
-     * values are read back from the signed token rather than re-queried.
+     * Persist the role into the token at sign-in. On later requests it is read
+     * back from the signed token rather than re-queried — but only ever as a
+     * hint for the optimistic proxy check; lib/auth/session.ts is authoritative.
      */
     jwt: async ({ token, user, trigger }) => {
       if (user) {
-        token.organizationId = user.organizationId
         token.role = user.role
       }
 
-      // Re-hydrate from the database if the token predates these claims or the
-      // session was explicitly updated (e.g. a role change).
-      //
-      // KNOWN GAP (out of scope for the auth-lookup fix in lib/auth/auth-lookup.ts,
-      // left as-is deliberately): this read also uses the unscoped `prisma`
-      // client with no tenant context, so under RLS it likewise returns
-      // nothing. In practice this branch only runs when `!token.organizationId`
-      // (a token that predates this field, or was somehow issued without it)
-      // or on an explicit `session.update()` call — neither happens in Phase 0's
-      // normal sign-in flow, where `token.organizationId` is always set at
-      // initial sign-in from the already-tenant-known `user` object above. If
-      // this ever needs to be load-bearing, it should get its own narrow fix
-      // (e.g. `withTenant` once organizationId is already on the token) rather
-      // than widening the SECURITY DEFINER exception designed for the email
-      // lookup, which must stay scoped to exactly that one query.
-      if ((trigger === 'update' || !token.organizationId) && token.sub) {
+      // Re-hydrate if the token predates the claim or the session was
+      // explicitly updated (e.g. a role change).
+      if ((trigger === 'update' || !token.role) && token.sub) {
         const dbUser = await prisma.user.findUnique({
           where: { id: token.sub },
-          select: { organizationId: true, role: true },
+          select: { role: true },
         })
         if (dbUser) {
-          token.organizationId = dbUser.organizationId
           token.role = dbUser.role
         }
       }
@@ -105,9 +90,6 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     session: async ({ session, token }) => {
       if (token.sub) {
         session.user.id = token.sub
-      }
-      if (token.organizationId) {
-        session.user.organizationId = token.organizationId
       }
       if (token.role) {
         session.user.role = token.role

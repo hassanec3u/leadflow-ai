@@ -10,22 +10,19 @@ import type { Role } from '@/lib/auth/rbac'
  * imported in the same file — and importing it purely to satisfy the augmenter
  * inside application code is noise.
  *
- * These claims are what carry tenant identity through the session. They are
- * still verified against the database on every request (lib/auth/session.ts);
- * the token is a cache, not the source of truth.
+ * `role` is re-verified against the database on every request
+ * (lib/auth/session.ts); the token is a cache, not the source of truth.
  */
 
 declare module 'next-auth' {
   interface Session {
     user: {
       id: string
-      organizationId: string
       role: Role
     } & DefaultSession['user']
   }
 
   interface User {
-    organizationId?: string
     role?: Role
   }
 }
@@ -40,7 +37,6 @@ declare module 'next-auth' {
  */
 declare module '@auth/core/jwt' {
   interface JWT {
-    organizationId?: string
     role?: Role
   }
 }

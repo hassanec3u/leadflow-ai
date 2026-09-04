@@ -32,7 +32,7 @@ import type {
 import { emptyEnrichmentData, ProviderCallError } from '@/lib/automation/providers'
 
 /** Recorded call, common shape across every mock's in-memory log. */
-export type RecordedCall<TInput> = { idempotencyKey: string; organizationId: string; input: TInput }
+export type RecordedCall<TInput> = { idempotencyKey: string; input: TInput }
 
 // ---------------------------------------------------------------------------
 // Enrichment
@@ -79,7 +79,6 @@ export class MockEnrichmentProvider implements EnrichmentProvider {
   async enrich(input: ProviderCall & { lead: LeadFacts }): Promise<EnrichmentResult> {
     this.calls.push({
       idempotencyKey: input.idempotencyKey,
-      organizationId: input.organizationId,
       input: { lead: input.lead },
     })
 
@@ -170,7 +169,6 @@ export class MockAiQualificationProvider implements AiQualificationProvider {
   ): Promise<unknown> {
     this.calls.push({
       idempotencyKey: input.idempotencyKey,
-      organizationId: input.organizationId,
       input: { lead: input.lead, enrichment: input.enrichment, config: input.config },
     })
 
@@ -214,7 +212,6 @@ export class MockEmailProvider implements EmailProvider {
     // hold even when the call ultimately fails, since a retry reuses it.
     this.calls.push({
       idempotencyKey: input.idempotencyKey,
-      organizationId: input.organizationId,
       input: { lead: input.lead, summary: input.summary },
     })
 
@@ -257,7 +254,6 @@ export class MockNotificationProvider implements NotificationProvider {
   ): Promise<{ ref: string | null }> {
     this.calls.push({
       idempotencyKey: input.idempotencyKey,
-      organizationId: input.organizationId,
       input: { lead: input.lead, runId: input.runId, kind: input.kind, detail: input.detail },
     })
 
@@ -276,15 +272,15 @@ export type MockAiBudgetGuardOptions = { exceeded?: boolean }
 
 /** Exceeding budget is not retriable — see AiBudgetGuard's contract. */
 export class MockAiBudgetGuard implements AiBudgetGuard {
-  readonly calls: { organizationId: string }[] = []
+  readonly calls: Record<string, never>[] = []
   private readonly exceeded: boolean
 
   constructor(options: MockAiBudgetGuardOptions = {}) {
     this.exceeded = options.exceeded ?? false
   }
 
-  async assertWithinBudget(organizationId: string): Promise<void> {
-    this.calls.push({ organizationId })
+  async assertWithinBudget(): Promise<void> {
+    this.calls.push({})
     if (this.exceeded) {
       throw new ProviderCallError('mock_ai_budget_exceeded', 'Mock AI budget exceeded', {
         retriable: false,

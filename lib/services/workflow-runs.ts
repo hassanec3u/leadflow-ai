@@ -8,7 +8,7 @@ import type {
   WorkflowStepRunStatus,
 } from '@prisma/client'
 
-import { withTenant } from '@/lib/db/tenant'
+import { prisma } from '@/lib/db/prisma'
 import { isUniqueConstraintViolation, UNIQUE_CONSTRAINTS } from '@/lib/db/prisma-errors'
 import { ConflictError, NotFoundError } from '@/lib/errors'
 import { emitRunRequested } from '@/lib/automation/events'
@@ -18,8 +18,7 @@ import { DEFAULT_ICP, DEFAULT_QUALIFICATION_THRESHOLD } from '@/lib/validation/q
 /**
  * Run and step persistence for the execution engine (Phase 2C).
  *
- * Every function here is tenant-scoped through `withTenant()` and therefore
- * runs inside a transaction. Two rules follow from that and are load-bearing:
+ * Two rules are load-bearing here:
  *
  *  1. NO provider/network call ever happens inside one of these functions —
  *     a transaction must never be held open across network I/O. The engine
@@ -27,11 +26,16 @@ import { DEFAULT_ICP, DEFAULT_QUALIFICATION_THRESHOLD } from '@/lib/validation/q
  *  2. Transitions are expressed as CONDITIONAL updates (`updateMany` with the
  *     expected current state in the WHERE clause), never read-then-write, so
  *     two concurrent executions cannot both believe they won.
+ *
+ * Every function that issues more than one statement wraps them in an explicit
+ * `prisma.$transaction`. That is not decoration: these functions previously
+ * inherited a transaction from `withTenant()`, and the read-then-conditional-
+ * write pairs below (claimRun, claimRunForRecovery, claimStep,
+ * applyAiQualification) depend on seeing a single snapshot.
  */
 
 export type RunForExecution = {
   id: string
-  organizationId: string
   workflowId: string
   workflowEnrollmentId: string
   leadId: string
@@ -51,7 +55,6 @@ export type StepRunRecord = {
 
 const RUN_SELECT = {
   id: true,
-  organizationId: true,
   workflowId: true,
   workflowEnrollmentId: true,
   leadId: true,
@@ -83,22 +86,16 @@ export const TERMINAL_RUN_STATES: ReadonlySet<WorkflowRunStatus> = new Set<Workf
 ])
 
 /**
- * Load a run, verifying the event's organization claim.
+ * Load a run by id, or null when it does not exist.
  *
- * The claimed organization id establishes tenant context; the run is then
- * looked up by id under RLS. A mismatched pair matches zero rows, so this
- * returns null and the caller aborts — a forged or stale event payload can
- * never execute against another tenant.
+ * The engine reads everything it acts on from this row rather than from the
+ * event payload, so a stale or forged event naming an unknown run simply
+ * aborts.
  */
-export async function loadRunForExecution(
-  claimedOrganizationId: string,
-  runId: string,
-): Promise<RunForExecution | null> {
-  if (!claimedOrganizationId || !runId) return null
+export async function loadRunForExecution(runId: string): Promise<RunForExecution | null> {
+  if (!runId) return null
 
-  return withTenant(claimedOrganizationId, (tx) =>
-    tx.workflowRun.findFirst({ where: { id: runId }, select: RUN_SELECT }),
-  )
+  return prisma.workflowRun.findFirst({ where: { id: runId }, select: RUN_SELECT })
 }
 
 export type ClaimRunResult =
@@ -115,8 +112,8 @@ export type ClaimRunResult =
  * the latter vanishingly unlikely, and every step transition is independently
  * guarded, so resuming is safe either way.
  */
-export async function claimRun(organizationId: string, runId: string): Promise<ClaimRunResult> {
-  return withTenant(organizationId, async (tx) => {
+export async function claimRun(runId: string): Promise<ClaimRunResult> {
+  return prisma.$transaction(async (tx) => {
     const claimed = await tx.workflowRun.updateMany({
       where: { id: runId, status: 'PENDING' },
       data: { status: 'RUNNING', startedAt: new Date() },
@@ -146,20 +143,19 @@ export type RecoveryClaimResult =
  *
  * The increment is a CONDITIONAL update keyed on the `recoveryAttempts` value
  * just read, not a read-then-write: two sweep ticks racing on the same run
- * (or the same run genuinely finishing between the sweep's cross-tenant read
- * and this call) means the loser's `updateMany` matches zero rows and gets
- * `NOT_RUNNING` back — never a lost update, never two generations minted for
- * one attempt. Same conditional-update idiom as `claimRun`/`finalizeRun`.
+ * (or the same run genuinely finishing between the sweep's read and this call)
+ * means the loser's `updateMany` matches zero rows and gets `NOT_RUNNING`
+ * back — never a lost update, never two generations minted for one attempt.
+ * Same conditional-update idiom as `claimRun`/`finalizeRun`.
  *
  * Never touches a `WorkflowStepRun` — resumption reads and reclaims those
  * itself via the ordinary `claimStep` path once execution is re-requested.
  */
 export async function claimRunForRecovery(
-  organizationId: string,
   runId: string,
   maxAttempts: number,
 ): Promise<RecoveryClaimResult> {
-  return withTenant(organizationId, async (tx) => {
+  return prisma.$transaction(async (tx) => {
     const current = await tx.workflowRun.findFirst({
       where: { id: runId, status: 'RUNNING' },
       select: { recoveryAttempts: true },
@@ -180,36 +176,28 @@ export async function claimRunForRecovery(
 
 /** Terminal transition. Conditional on the run still being RUNNING. */
 export async function finalizeRun(
-  organizationId: string,
   runId: string,
   status: Extract<WorkflowRunStatus, 'SUCCEEDED' | 'FAILED' | 'BLOCKED'>,
 ): Promise<void> {
-  await withTenant(organizationId, (tx) =>
-    tx.workflowRun.updateMany({
-      where: { id: runId, status: 'RUNNING' },
-      data: { status, completedAt: new Date() },
-    }),
-  )
+  await prisma.workflowRun.updateMany({
+    where: { id: runId, status: 'RUNNING' },
+    data: { status, completedAt: new Date() },
+  })
 }
 
-export async function loadLeadFacts(
-  organizationId: string,
-  leadId: string,
-): Promise<LeadFacts | null> {
-  const lead = await withTenant(organizationId, (tx) =>
-    tx.lead.findFirst({
-      where: { id: leadId },
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        company: true,
-        phone: true,
-        formMessage: true,
-        source: true,
-      },
-    }),
-  )
+export async function loadLeadFacts(leadId: string): Promise<LeadFacts | null> {
+  const lead = await prisma.lead.findFirst({
+    where: { id: leadId },
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      company: true,
+      phone: true,
+      formMessage: true,
+      source: true,
+    },
+  })
   return lead ?? null
 }
 
@@ -230,19 +218,18 @@ export type PinnedQualificationConfig = {
  * editing the ICP mid-run must not move the bar under it, and replaying the
  * same row must reach the same verdict.
  *
- * When the organization has never saved a configuration the defaults apply and
- * nothing is pinned: there is no version row to point at, and inventing one
- * would record a decision the admin never made.
+ * When no configuration has ever been saved the defaults apply and nothing is
+ * pinned: there is no version row to point at, and inventing one would record
+ * a decision the admin never made.
  *
  * Lives here rather than beside the admin read/save service on purpose: this
  * runs inside the engine, which must stay free of any session dependency —
  * importing `lib/auth/session` here would drag next-auth into the pipeline.
  */
 export async function pinQualificationConfigForRun(
-  organizationId: string,
   runId: string,
 ): Promise<PinnedQualificationConfig> {
-  return withTenant(organizationId, async (tx) => {
+  return prisma.$transaction(async (tx) => {
     const run = await tx.workflowRun.findFirst({
       where: { id: runId },
       select: { qualificationConfigVersionId: true },
@@ -264,7 +251,6 @@ export async function pinQualificationConfigForRun(
     }
 
     const latest = await tx.qualificationConfigVersion.findFirst({
-      where: { organizationId },
       orderBy: { version: 'desc' },
     })
 
@@ -294,7 +280,8 @@ export async function pinQualificationConfigForRun(
 }
 
 export type StepClaim =
-  { kind: 'memoized'; stepRun: StepRunRecord } | { kind: 'claimed'; stepRun: StepRunRecord }
+  | { kind: 'memoized'; stepRun: StepRunRecord }
+  | { kind: 'claimed'; stepRun: StepRunRecord }
 
 /**
  * Claim a step for execution: create-or-update its row to RUNNING and
@@ -310,11 +297,10 @@ export type StepClaim =
  * attempt and never on a memoized short-circuit.
  */
 export async function claimStep(
-  organizationId: string,
   workflowRunId: string,
   step: WorkflowStepKind,
 ): Promise<StepClaim> {
-  return withTenant(organizationId, async (tx) => {
+  return prisma.$transaction(async (tx) => {
     const existing = await tx.workflowStepRun.findFirst({
       where: { workflowRunId, step },
       select: STEP_SELECT,
@@ -377,26 +363,23 @@ export type StepCompletion = {
 }
 
 export async function completeStep(
-  organizationId: string,
   stepRunId: string,
   completion: StepCompletion,
 ): Promise<void> {
-  await withTenant(organizationId, (tx) =>
-    tx.workflowStepRun.updateMany({
-      where: { id: stepRunId },
-      data: {
-        status: completion.status,
-        completedAt: new Date(),
-        ...(completion.output === undefined
-          ? {}
-          : {
-              output: (completion.output ?? Prisma.DbNull) as Prisma.InputJsonValue,
-            }),
-        errorCode: completion.errorCode ?? null,
-        errorMessage: completion.errorMessage ?? null,
-      },
-    }),
-  )
+  await prisma.workflowStepRun.updateMany({
+    where: { id: stepRunId },
+    data: {
+      status: completion.status,
+      completedAt: new Date(),
+      ...(completion.output === undefined
+        ? {}
+        : {
+            output: (completion.output ?? Prisma.DbNull) as Prisma.InputJsonValue,
+          }),
+      errorCode: completion.errorCode ?? null,
+      errorMessage: completion.errorMessage ?? null,
+    },
+  })
 }
 
 /**
@@ -410,11 +393,10 @@ export async function completeStep(
  * "a human owns this" signal.
  */
 export async function applyAiQualification(
-  organizationId: string,
   leadId: string,
   input: { score: number; outcome: LeadQualificationOutcome },
 ): Promise<{ humanOverride: boolean; effectiveOutcome: LeadQualificationOutcome | null }> {
-  return withTenant(organizationId, async (tx) => {
+  return prisma.$transaction(async (tx) => {
     await tx.lead.updateMany({ where: { id: leadId }, data: { aiScore: input.score } })
 
     const updated = await tx.lead.updateMany({
@@ -452,15 +434,13 @@ export async function applyAiQualification(
  * run is in flight" — this maps that violation to a ConflictError rather than
  * relying on a check-then-insert that a concurrent caller could slip past.
  *
- * `organizationId` is a trusted parameter (see lib/services/automation-enrollment.ts
- * for the same convention): the caller — a future server action — is
- * responsible for `requireCapability('automation:manage')` before calling.
+ * Authorization is the CALLER's responsibility: the server action that reaches
+ * this must have called `requireCapability('automation:manage')` first. This
+ * module is deliberately session-free (see pinQualificationConfigForRun) and
+ * therefore cannot check for itself.
  */
-export async function requestManualRerun(
-  organizationId: string,
-  sourceRunId: string,
-): Promise<RunForExecution> {
-  const created = await withTenant(organizationId, async (tx) => {
+export async function requestManualRerun(sourceRunId: string): Promise<RunForExecution> {
+  const created = await prisma.$transaction(async (tx) => {
     const source = await tx.workflowRun.findFirst({
       where: { id: sourceRunId },
       select: RUN_SELECT,
@@ -476,7 +456,6 @@ export async function requestManualRerun(
     try {
       return await tx.workflowRun.create({
         data: {
-          organizationId,
           workflowId: source.workflowId,
           workflowEnrollmentId: source.workflowEnrollmentId,
           leadId: source.leadId,
@@ -500,7 +479,6 @@ export async function requestManualRerun(
   // the row exists would execute against nothing.
   await emitRunRequested({
     runId: created.id,
-    organizationId,
     leadId: created.leadId,
     trigger: 'MANUAL_RERUN',
   })

@@ -3,7 +3,7 @@ import 'server-only'
 import type { QualificationConfigVersion } from '@prisma/client'
 
 import { requireCapability, requireUser } from '@/lib/auth/session'
-import { withTenant, type TenantDb } from '@/lib/db/tenant'
+import { prisma } from '@/lib/db/prisma'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-errors'
 import { ConflictError, ValidationError } from '@/lib/errors'
 import { logger } from '@/lib/logger'
@@ -14,21 +14,20 @@ import {
 } from '@/lib/validation/qualification-config'
 
 /**
- * The organization's qualification configuration — append-only.
+ * The qualification configuration — append-only.
  *
  * Saving never updates a row: it inserts the next version. A WorkflowRun then
  * points at the version it was judged against, so "why did this lead score 65
  * in March?" survives the ICP being rewritten five times. Nothing here
  * deletes.
  *
- * Tenancy comes from the session on every path; no function takes an
- * organization id, so no caller can pass one in, and Postgres RLS remains the
- * second barrier underneath.
+ * Writing is capability-gated (see saveQualificationConfig); the caller always
+ * comes from the session.
  */
 
 const CONFIG_UNIQUE = {
-  columns: ['organizationId', 'version'],
-  indexName: 'qualification_config_versions_organizationId_version_key',
+  columns: ['version'],
+  indexName: 'qualification_config_versions_version_key',
 } as const
 
 export type QualificationConfigView = {
@@ -42,45 +41,41 @@ export type QualificationConfigView = {
   isCustomised: boolean
 }
 
-async function findLatest(
-  tx: TenantDb,
-  organizationId: string,
-): Promise<QualificationConfigVersion | null> {
-  return tx.qualificationConfigVersion.findFirst({
-    where: { organizationId },
+type ConfigReader = Pick<typeof prisma, 'qualificationConfigVersion'>
+
+async function findLatest(db: ConfigReader): Promise<QualificationConfigVersion | null> {
+  return db.qualificationConfigVersion.findFirst({
     orderBy: { version: 'desc' },
   })
 }
 
 /** Read the current configuration, or the defaults when none has been saved. */
 export async function getQualificationConfig(): Promise<QualificationConfigView> {
-  const user = await requireUser()
+  await requireUser()
 
-  return withTenant(user.organizationId, async (tx) => {
-    const latest = await findLatest(tx, user.organizationId)
+  const latest = await findLatest(prisma)
 
-    if (!latest) {
-      return {
-        id: null,
-        version: 0,
-        icp: DEFAULT_ICP,
-        instructions: null,
-        threshold: DEFAULT_QUALIFICATION_THRESHOLD,
-        updatedAtLabel: null,
-        isCustomised: false,
-      }
-    }
-
+  if (!latest) {
     return {
-      id: latest.id,
-      version: latest.version,
-      icp: latest.icp,
-      instructions: latest.instructions,
-      threshold: latest.threshold,
-      updatedAtLabel: latest.createdAt.toISOString(),
-      isCustomised: true,
+      id: null,
+      version: 0,
+      icp: DEFAULT_ICP,
+      instructions: null,
+      threshold: DEFAULT_QUALIFICATION_THRESHOLD,
+      updatedAtLabel: null,
+      isCustomised: false,
     }
-  })
+  }
+
+  return {
+    id: latest.id,
+    version: latest.version,
+    icp: latest.icp,
+    instructions: latest.instructions,
+    threshold: latest.threshold,
+    updatedAtLabel: latest.createdAt.toISOString(),
+    isCustomised: true,
+  }
 }
 
 /**
@@ -107,8 +102,11 @@ export async function saveQualificationConfig(rawInput: unknown): Promise<Qualif
   }
   const input = parsed.data
 
-  const created = await withTenant(user.organizationId, async (tx) => {
-    const latest = await findLatest(tx, user.organizationId)
+  // Transaction: "read the latest version, then insert the next one" is one
+  // decision. The unique index below is what actually serialises concurrent
+  // saves, but the pair must still see a single snapshot.
+  const created = await prisma.$transaction(async (tx) => {
+    const latest = await findLatest(tx)
 
     const unchanged =
       latest !== null &&
@@ -120,7 +118,6 @@ export async function saveQualificationConfig(rawInput: unknown): Promise<Qualif
     try {
       return await tx.qualificationConfigVersion.create({
         data: {
-          organizationId: user.organizationId,
           version: (latest?.version ?? 0) + 1,
           icp: input.icp,
           instructions: input.instructions,
@@ -129,8 +126,8 @@ export async function saveQualificationConfig(rawInput: unknown): Promise<Qualif
         },
       })
     } catch (error) {
-      // Two admins saved at once. The unique (organizationId, version) index
-      // is what serialises them — the loser must re-read rather than silently
+      // Two admins saved at once. The unique (version) index is what
+      // serialises them — the loser must re-read rather than silently
       // overwrite a version number with different content.
       if (isUniqueConstraintViolation(error, CONFIG_UNIQUE)) {
         throw new ConflictError(
@@ -143,7 +140,6 @@ export async function saveQualificationConfig(rawInput: unknown): Promise<Qualif
 
   // The event, never the content: an ICP is customer strategy.
   logger.info('Qualification config saved', {
-    orgId: user.organizationId,
     userId: user.id,
     version: created.version,
     threshold: created.threshold,

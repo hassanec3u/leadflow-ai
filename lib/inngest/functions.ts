@@ -54,8 +54,6 @@ export const leadQualificationPipeline = inngest.createFunction(
     return executeWorkflowRun(
       {
         runId: data.runId,
-        // A claim: the engine verifies it against the run under RLS.
-        organizationId: data.organizationId,
         // `step.run` returns the JSON-serialized result on replay, which is
         // exactly what the engine expects to rebuild its state from.
         stepRunner: (id, fn) => step.run(id, fn) as ReturnType<typeof fn>,

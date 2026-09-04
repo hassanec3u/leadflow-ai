@@ -22,9 +22,8 @@ import { createLeadAction } from '@/app/(app)/leads/actions'
  * "Add Lead" flow, backed by the real Lead service via `createLeadAction`.
  * `source` is fixed to `MANUAL` here — a lead entered through this dialog is,
  * by definition, a manual entry; adding a source picker isn't required by
- * this task. `organizationId`/`ownerId` are never supplied by this form —
- * the service derives the org from the session and defaults the owner to the
- * caller.
+ * this task. `ownerId` is never supplied by this form — the service defaults
+ * the owner to the caller.
  */
 export function AddLeadDialog({ onCreated }: { onCreated: () => void }) {
   const [open, setOpen] = useState(false)

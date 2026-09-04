@@ -8,9 +8,9 @@ Implemented 2026-09-01. As-built detail in `docs/architecture.md` §11; status a
 
 - [x] Repo scaffold (Next.js 16.3.4 App Router, TypeScript strict, Tailwind v4, shadcn/ui), lint/typecheck/test pipeline via `npm run verify`
 - [x] Auth via **Auth.js (NextAuth v5) + Prisma Adapter** — Credentials provider only; **Google OAuth not implemented**
-- [x] Organization model + signup that provisions an org and its first ADMIN
-- [x] Base DB schema (Prisma 7) + migrations for Organization/User — **not** Lead, which is Phase 1
-- [x] Session-derived multi-tenancy DAL + Postgres RLS with `FORCE`, proven by tests against real PostgreSQL
+- [x] ~~Organization model + signup that provisions an org and its first ADMIN~~ — removed: the product is single-tenant, and accounts are provisioned by `npm run db:seed`
+- [x] Base DB schema (Prisma 7) + migrations for User — **not** Lead, which is Phase 1
+- [x] ~~Session-derived multi-tenancy DAL + Postgres RLS~~ — removed with multi-tenancy. The session-derived DAL (`requireUser`, `requireCapability`) remains.
 - [x] `AppShell` (dark sidebar + light content), routing skeleton, capability-based nav filtering
 - [ ] CI/CD — not configured; `npm run verify` runs the gate locally
 - [ ] Invite flow — deferred to Phase 7 (settings/users), was not in the Phase 0 requirement list
@@ -26,7 +26,7 @@ Implemented 2026-09-01. As-built detail in `docs/architecture.md` §11; status a
 ## Phase 2 — Automation Pipeline Engine (highest technical risk — build first)
 
 - Job queue integration: **Inngest** (decided — see `docs/architecture.md` §3.2)
-- Multi-tenant foundation for this phase: `org_id` denormalized on every tenant table + Postgres RLS enabled (architecture.md §4) — **not deferred**, since this phase is where cross-tenant leakage would first become possible.
+- ~~Multi-tenant foundation~~ — removed. The product is single-tenant (architecture.md §4).
 - Single auto-provisioned `Workflow`/`WorkflowStep` (fixed pipeline definition, not a builder — architecture.md §10) + `WorkflowRun`/`WorkflowRunStep` schema, including the `blocked` status and `dedup_key` uniqueness (architecture.md §5). Originally 7 steps including "Add to CRM"; that step was later removed (architecture.md §5) since LeadFlow's own `Lead` row is already the system of record — the shipped pipeline is Ingest + 5 execution steps.
 - Inbound webhook + form capture → upsert-on-`(org_id, email)` → enqueue run, with idempotency keys on every side-effecting step call.
 - `/automation/runs` execution history view, retry action.
@@ -71,7 +71,7 @@ Implemented 2026-09-01. As-built detail in `docs/architecture.md` §11; status a
 ## Phase 8 — Hardening & Launch Readiness
 
 - Full pass on error/loading/empty states across all pages
-- Security review (RLS policy coverage verified — not introduced here, it shipped in Phase 2 — webhook signing for both our own and third-party providers, credential encryption, audit log coverage)
+- Security review (webhook signing for both our own and third-party providers, credential encryption, audit log coverage)
 - Verify lead-deletion cascade (product-spec.md §12.1) actually removes PII-bearing child rows
 - Load-test the pipeline (queue backpressure under lead-volume spikes; confirm dedup/idempotency holds under duplicate webhook delivery)
 - Test suite completion (see `tests.json`)

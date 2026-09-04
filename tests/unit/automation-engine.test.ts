@@ -12,21 +12,17 @@ import type {
  * Phase 2C — the fixed-pipeline execution engine.
  *
  * Same approach as tests/unit/automation-enrollment.test.ts: `@/lib/db/prisma`
- * is an in-memory fake that mimics enough of Prisma + Postgres RLS to prove
- * the engine's own logic (a row is visible only when its organization matches
- * the context the last `withTenant()` established, mirroring
- * `SET LOCAL app.current_org_id`). Providers are hand-written fakes — no
- * vendor implementations exist in this phase and none are needed to prove the
- * failure semantics.
+ * is an in-memory fake that mimics enough of Prisma to prove the engine's own
+ * logic. Providers are hand-written fakes — no vendor implementations exist in
+ * this phase and none are needed to prove the failure semantics.
  *
- * Real Postgres constraints and RLS for these tables are proven separately in
+ * Real Postgres constraints for these tables are proven separately in
  * tests/integration/automation-execution.test.ts.
  */
 
 const state = vi.hoisted(() => {
   type Lead = {
     id: string
-    organizationId: string
     name: string
     email: string
     company: string | null
@@ -40,16 +36,14 @@ const state = vi.hoisted(() => {
   }
   type Workflow = {
     id: string
-    organizationId: string
     type: string
     status: string
     version: number
   }
-  type Enrollment = { id: string; organizationId: string; workflowId: string; leadId: string }
-  /** Append-only qualification config versions, keyed by organization. */
+  type Enrollment = { id: string; workflowId: string; leadId: string }
+  /** Append-only qualification config versions. */
   type ConfigVersion = {
     id: string
-    organizationId: string
     version: number
     icp: string
     instructions: string | null
@@ -57,7 +51,6 @@ const state = vi.hoisted(() => {
   }
   type Run = {
     id: string
-    organizationId: string
     workflowId: string
     workflowEnrollmentId: string
     leadId: string
@@ -91,7 +84,6 @@ const state = vi.hoisted(() => {
   const runs: Run[] = []
   const stepRuns: StepRun[] = []
   const configVersions: ConfigVersion[] = []
-  let currentOrgId: string | null = null
   let counter = 0
   /** Set to a step name to make the NEXT completeStep for it throw once. */
   let failPersistForStep: string | null = null
@@ -110,7 +102,6 @@ const state = vi.hoisted(() => {
       runs.length = 0
       stepRuns.length = 0
       configVersions.length = 0
-      currentOrgId = null
       counter = 0
       failPersistForStep = null
     },
@@ -118,16 +109,8 @@ const state = vi.hoisted(() => {
       counter += 1
       return `${prefix}_${counter}`
     },
-    setOrgContext(id: string) {
-      currentOrgId = id
-    },
-    /** Mirrors RLS: nothing visible without context, nothing outside the tenant. */
-    visible(row: { organizationId: string }) {
-      return currentOrgId !== null && row.organizationId === currentOrgId
-    },
-    visibleRun(runId: string) {
-      const run = runs.find((r) => r.id === runId)
-      return run && currentOrgId !== null && run.organizationId === currentOrgId ? run : null
+    runById(runId: string) {
+      return runs.find((r) => r.id === runId) ?? null
     },
     failPersistOnce(step: string) {
       failPersistForStep = step
@@ -170,13 +153,9 @@ vi.mock('@/lib/db/prisma', async () => {
   }
 
   const tx = {
-    $executeRaw: async (_s: TemplateStringsArray, ...values: unknown[]) => {
-      state.setOrgContext(values[0] as string)
-      return 1
-    },
     lead: {
       findFirst: async ({ where }: { where: Record<string, unknown> }) =>
-        state.leads.find((l) => state.visible(l) && l.id === where.id) ?? null,
+        state.leads.find((l) => l.id === where.id) ?? null,
       updateMany: async ({
         where,
         data,
@@ -184,7 +163,7 @@ vi.mock('@/lib/db/prisma', async () => {
         where: Record<string, unknown>
         data: Record<string, unknown>
       }) => {
-        const lead = state.leads.find((l) => state.visible(l) && l.id === where.id)
+        const lead = state.leads.find((l) => l.id === where.id)
         if (!lead) return { count: 0 }
         // The conditional qualification write: OR: [{source: null}, {source: 'AI'}]
         if (Array.isArray(where.OR)) {
@@ -201,20 +180,14 @@ vi.mock('@/lib/db/prisma', async () => {
       findFirst: async ({ where }: { where: Record<string, unknown> }) =>
         state.workflows.find(
           (w) =>
-            state.visible(w) &&
             (where.id === undefined || w.id === where.id) &&
             (where.type === undefined || w.type === where.type),
         ) ?? null,
     },
     qualificationConfigVersion: {
-      findFirst: async ({ where }: { where: Record<string, unknown> }) => {
+      findFirst: async ({ where }: { where?: Record<string, unknown> } = {}) => {
         const rows = state.configVersions
-          .filter(
-            (c) =>
-              state.visible(c) &&
-              (where.id === undefined || c.id === where.id) &&
-              (where.organizationId === undefined || c.organizationId === where.organizationId),
-          )
+          .filter((c) => where?.id === undefined || c.id === where.id)
           .sort((a, b) => b.version - a.version)
         return rows[0] ?? null
       },
@@ -223,7 +196,6 @@ vi.mock('@/lib/db/prisma', async () => {
       findFirst: async ({ where }: { where: Record<string, unknown> }) => {
         const found = state.runs.find(
           (r) =>
-            state.visible(r) &&
             (where.id === undefined || r.id === where.id) &&
             (where.workflowEnrollmentId === undefined ||
               r.workflowEnrollmentId === where.workflowEnrollmentId) &&
@@ -243,7 +215,6 @@ vi.mock('@/lib/db/prisma', async () => {
       }) => {
         const run = state.runs.find(
           (r) =>
-            state.visible(r) &&
             r.id === where.id &&
             (where.status === undefined || r.status === where.status) &&
             (where.recoveryAttempts === undefined || r.recoveryAttempts === where.recoveryAttempts),
@@ -251,6 +222,24 @@ vi.mock('@/lib/db/prisma', async () => {
         if (!run) return { count: 0 }
         Object.assign(run, data)
         return { count: 1 }
+      },
+      // The PENDING-orphan sweep is an ordinary query now (it used to go
+      // through a SECURITY DEFINER function to escape RLS), so the fake has to
+      // answer it like Prisma would.
+      findMany: async ({
+        where,
+        take,
+      }: {
+        where?: Record<string, unknown>
+        take?: number
+      } = {}) => {
+        const createdAtFilter = where?.createdAt as { lt?: Date } | undefined
+        const rows = state.runs.filter(
+          (r) =>
+            (where?.status === undefined || r.status === where.status) &&
+            (createdAtFilter?.lt === undefined || r.createdAt < createdAtFilter.lt),
+        )
+        return rows.slice(0, take).map((r) => ({ ...r }))
       },
       create: async ({ data }: { data: Record<string, unknown> }) => {
         const trigger = data.trigger as string
@@ -273,7 +262,6 @@ vi.mock('@/lib/db/prisma', async () => {
         }
         const run = {
           id: state.id('run'),
-          organizationId: data.organizationId as string,
           workflowId: data.workflowId as string,
           workflowEnrollmentId: enrollmentId,
           leadId,
@@ -294,10 +282,7 @@ vi.mock('@/lib/db/prisma', async () => {
     workflowStepRun: {
       findFirst: async ({ where }: { where: Record<string, unknown> }) =>
         state.stepRuns.find(
-          (s) =>
-            state.visibleRun(s.workflowRunId) !== null &&
-            s.workflowRunId === where.workflowRunId &&
-            s.step === where.step,
+          (s) => s.workflowRunId === where.workflowRunId && s.step === where.step,
         ) ?? null,
       create: async ({ data }: { data: Record<string, unknown> }) => {
         const workflowRunId = data.workflowRunId as string
@@ -348,7 +333,12 @@ vi.mock('@/lib/db/prisma', async () => {
   }
 
   return {
+    // The same delegates are reachable directly on `prisma` and inside a
+    // `$transaction` callback, because the services now use both: single
+    // statements go straight to the client, multi-statement sequences take a
+    // transaction.
     prisma: {
+      ...tx,
       $transaction: async (fn: (client: unknown) => Promise<unknown>) => fn(tx),
       $queryRaw: (...args: unknown[]) => queryRawMock(...args),
     },
@@ -359,9 +349,6 @@ const queryRawMock = vi.fn(async (...args: unknown[]) => {
   void args
   return [] as unknown[]
 })
-
-const ACME = 'org_acme'
-const GLOBEX = 'org_globex'
 
 async function importEngine() {
   vi.resetModules()
@@ -408,14 +395,10 @@ function makeRegistry(overrides: Partial<ProviderRegistry> = {}): ProviderRegist
   }
 }
 
-/** Seeds an organization with a lead, workflow, enrollment and a PENDING run. */
-function seedRun(
-  options: { organizationId?: string; leadOverrides?: Record<string, unknown> } = {},
-) {
-  const organizationId = options.organizationId ?? ACME
+/** Seeds a lead, workflow, enrollment and a PENDING run. */
+function seedRun(options: { leadOverrides?: Record<string, unknown> } = {}) {
   const lead = {
     id: state.id('lead'),
-    organizationId,
     name: 'Jane Prospect',
     email: 'jane@prospect.test',
     company: 'Acme Corp',
@@ -430,20 +413,17 @@ function seedRun(
   }
   const workflow = {
     id: state.id('wf'),
-    organizationId,
     type: 'LEAD_QUALIFICATION',
     status: 'ACTIVE',
     version: 1,
   }
   const enrollment = {
     id: state.id('enr'),
-    organizationId,
     workflowId: workflow.id,
     leadId: lead.id,
   }
   const run = {
     id: state.id('run'),
-    organizationId,
     workflowId: workflow.id,
     workflowEnrollmentId: enrollment.id,
     leadId: lead.id,
@@ -463,7 +443,7 @@ function seedRun(
   state.enrollments.push(enrollment as never)
   state.runs.push(run as never)
 
-  return { organizationId, lead, workflow, enrollment, run }
+  return { lead, workflow, enrollment, run }
 }
 
 const noSleep = async () => undefined
@@ -486,10 +466,7 @@ describe('Automation execution engine', () => {
     const { run, lead } = seedRun()
     const providers = makeRegistry()
 
-    const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
+    const result = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     expect(result.runStatus).toBe('SUCCEEDED')
     for (const step of ['ENRICH', 'AI_QUALIFY', 'SCORE_AND_TAG', 'SEND_EMAIL', 'NOTIFY_TEAM']) {
@@ -508,10 +485,7 @@ describe('Automation execution engine', () => {
     const { run, lead } = seedRun()
     const providers = makeRegistry({ ai: makeAi(42) })
 
-    const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
+    const result = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     expect(result.runStatus).toBe('SUCCEEDED')
     expect(stepStatus(run.id, 'SEND_EMAIL')?.status).toBe('SKIPPED')
@@ -522,11 +496,10 @@ describe('Automation execution engine', () => {
   })
 
   describe('configured threshold', () => {
-    /** Save an org config version directly — the engine reads, never writes it. */
-    function seedConfig(threshold: number, organizationId = ACME) {
+    /** Save a config version directly — the engine reads, never writes it. */
+    function seedConfig(threshold: number) {
       state.configVersions.push({
         id: `cfg_${state.configVersions.length + 1}`,
-        organizationId,
         version: state.configVersions.length + 1,
         icp: 'Configured ICP.',
         instructions: null,
@@ -534,14 +507,14 @@ describe('Automation execution engine', () => {
       })
     }
 
-    it('uses the organization threshold instead of the built-in 70', async () => {
+    it('uses the configured threshold instead of the built-in 70', async () => {
       seedConfig(90)
       const { executeWorkflowRun } = await importEngine()
       const { run, lead } = seedRun()
 
-      // 80 clears the default 70 but not this organization's 90.
+      // 80 clears the default 70 but not the configured 90.
       await executeWorkflowRun(
-        { runId: run.id, organizationId: ACME },
+        { runId: run.id },
         { providers: makeRegistry({ ai: makeAi(80) }), sleep: noSleep },
       )
 
@@ -549,13 +522,13 @@ describe('Automation execution engine', () => {
       expect(stepStatus(run.id, 'SEND_EMAIL')?.errorCode).toBe('below_threshold')
     })
 
-    it('qualifies below 70 when the organization lowered its bar', async () => {
+    it('qualifies below 70 when the configured bar is lower', async () => {
       seedConfig(30)
       const { executeWorkflowRun } = await importEngine()
       const { run, lead } = seedRun()
 
       await executeWorkflowRun(
-        { runId: run.id, organizationId: ACME },
+        { runId: run.id },
         { providers: makeRegistry({ ai: makeAi(42) }), sleep: noSleep },
       )
 
@@ -569,7 +542,7 @@ describe('Automation execution engine', () => {
       const { run } = seedRun()
 
       await executeWorkflowRun(
-        { runId: run.id, organizationId: ACME },
+        { runId: run.id },
         { providers: makeRegistry({ ai: makeAi(80) }), sleep: noSleep },
       )
 
@@ -584,7 +557,7 @@ describe('Automation execution engine', () => {
       const ai = makeAi(60)
 
       await executeWorkflowRun(
-        { runId: run.id, organizationId: ACME },
+        { runId: run.id },
         { providers: makeRegistry({ ai }), sleep: noSleep },
       )
 
@@ -598,27 +571,13 @@ describe('Automation execution engine', () => {
       const { run, lead } = seedRun()
 
       await executeWorkflowRun(
-        { runId: run.id, organizationId: ACME },
+        { runId: run.id },
         { providers: makeRegistry({ ai: makeAi(70) }), sleep: noSleep },
       )
 
       expect(state.leads.find((l) => l.id === lead.id)?.qualificationOutcome).toBe('QUALIFIED')
       // Nothing pinned: there is no version row to point at.
       expect(state.runs.find((r) => r.id === run.id)?.qualificationConfigVersionId).toBeFalsy()
-    })
-
-    it('ignores another organization’s configuration', async () => {
-      seedConfig(5, GLOBEX)
-      const { executeWorkflowRun } = await importEngine()
-      const { run, lead } = seedRun()
-
-      // Acme has none of its own; Globex's must not leak in and qualify a 10.
-      await executeWorkflowRun(
-        { runId: run.id, organizationId: ACME },
-        { providers: makeRegistry({ ai: makeAi(10) }), sleep: noSleep },
-      )
-
-      expect(state.leads.find((l) => l.id === lead.id)?.qualificationOutcome).toBe('UNQUALIFIED')
     })
   })
 
@@ -627,10 +586,7 @@ describe('Automation execution engine', () => {
     const { run, lead } = seedRun()
     const providers = makeRegistry({ ai: makeAi(70) })
 
-    const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
+    const result = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     expect(result.runStatus).toBe('SUCCEEDED')
     expect(state.leads.find((l) => l.id === lead.id)?.qualificationOutcome).toBe('QUALIFIED')
@@ -642,7 +598,7 @@ describe('Automation execution engine', () => {
     const { run, lead } = seedRun()
 
     await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
+      { runId: run.id },
       { providers: makeRegistry({ ai: makeAi(100) }), sleep: noSleep },
     )
 
@@ -655,10 +611,7 @@ describe('Automation execution engine', () => {
     const { run, lead } = seedRun()
     const providers = makeRegistry({ ai: makeAi(0) })
 
-    const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
+    const result = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     // 0 is a real score, not "unscored": it is stored, and it disqualifies.
     expect(state.leads.find((l) => l.id === lead.id)?.aiScore).toBe(0)
@@ -672,7 +625,7 @@ describe('Automation execution engine', () => {
     const { run } = seedRun()
 
     const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
+      { runId: run.id },
       { providers: makeRegistry({ enrichment: null }), sleep: noSleep },
     )
 
@@ -689,10 +642,7 @@ describe('Automation execution engine', () => {
     enrichment.enrich.mockRejectedValue(new Error('enrichment upstream down'))
     const providers = makeRegistry({ enrichment })
 
-    const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
+    const result = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     expect(result.runStatus).toBe('FAILED')
     expect(stepStatus(run.id, 'ENRICH')?.status).toBe('FAILED')
@@ -711,10 +661,7 @@ describe('Automation execution engine', () => {
     ai.qualify.mockRejectedValue(new Error('model unavailable'))
     const providers = makeRegistry({ ai })
 
-    const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
+    const result = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     expect(result.runStatus).toBe('FAILED')
     expect(stepStatus(run.id, 'AI_QUALIFY')?.status).toBe('FAILED')
@@ -731,10 +678,7 @@ describe('Automation execution engine', () => {
     ai.qualify.mockResolvedValue({ score: 'very high', summary: '' } as never)
     const providers = makeRegistry({ ai })
 
-    const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
+    const result = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     expect(result.runStatus).toBe('FAILED')
     expect(stepStatus(run.id, 'AI_QUALIFY')?.errorCode).toBe('ai_output_malformed')
@@ -758,10 +702,7 @@ describe('Automation execution engine', () => {
       },
     })
 
-    const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
+    const result = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     expect(result.runStatus).toBe('FAILED')
     expect(stepStatus(run.id, 'AI_QUALIFY')?.status).toBe('FAILED')
@@ -778,10 +719,7 @@ describe('Automation execution engine', () => {
     // AI would say UNQUALIFIED; the human already said QUALIFIED.
     const providers = makeRegistry({ ai: makeAi(30) })
 
-    const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
+    const result = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     const stored = state.leads.find((l) => l.id === lead.id)
     expect(stored?.qualificationOutcome).toBe('QUALIFIED')
@@ -804,10 +742,7 @@ describe('Automation execution engine', () => {
     const { run } = seedRun()
     const providers = makeRegistry({ email: null })
 
-    const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
+    const result = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     expect(stepStatus(run.id, 'SEND_EMAIL')?.status).toBe('BLOCKED')
     expect(stepStatus(run.id, 'SEND_EMAIL')?.errorCode).toBe('email_provider_not_configured')
@@ -824,10 +759,7 @@ describe('Automation execution engine', () => {
     const notification = makeNotification()
     const providers = makeRegistry({ email, notification })
 
-    const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
+    const result = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     expect(result.runStatus).toBe('FAILED')
     expect(stepStatus(run.id, 'SEND_EMAIL')?.status).toBe('FAILED')
@@ -845,7 +777,7 @@ describe('Automation execution engine', () => {
     notification.notify.mockRejectedValue(new Error('slack down'))
 
     const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
+      { runId: run.id },
       { providers: makeRegistry({ notification }), sleep: noSleep },
     )
 
@@ -862,7 +794,7 @@ describe('Automation execution engine', () => {
       .mockResolvedValue({ provider: 'fake', data: {} })
 
     const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
+      { runId: run.id },
       { providers: makeRegistry({ enrichment }), sleep: noSleep },
     )
 
@@ -877,14 +809,8 @@ describe('Automation execution engine', () => {
     const { run } = seedRun()
     const providers = makeRegistry()
 
-    const first = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
-    const second = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
+    const first = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
+    const second = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     expect(first.runStatus).toBe('SUCCEEDED')
     expect(second.outcome).toBe('ALREADY_TERMINAL')
@@ -898,13 +824,13 @@ describe('Automation execution engine', () => {
     const email = makeEmail()
     const providers = makeRegistry({ email })
 
-    await executeWorkflowRun({ runId: run.id, organizationId: ACME }, { providers, sleep: noSleep })
+    await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     // Re-open the run as a crash-resume would, then execute again.
     const stored = state.runs.find((r) => r.id === run.id)!
     stored.status = 'PENDING'
 
-    await executeWorkflowRun({ runId: run.id, organizationId: ACME }, { providers, sleep: noSleep })
+    await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     expect(email.send).toHaveBeenCalledTimes(1)
     expect(stepStatus(run.id, 'SEND_EMAIL')?.attempts).toBe(1)
@@ -917,7 +843,7 @@ describe('Automation execution engine', () => {
     state.failPersistOnce('SEND_EMAIL')
 
     const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
+      { runId: run.id },
       { providers: makeRegistry({ email }), sleep: noSleep },
     )
 
@@ -932,28 +858,29 @@ describe('Automation execution engine', () => {
     expect(result.runStatus).toBe('SUCCEEDED')
   })
 
-  it('22a. a run is not executed under a mismatched organization claim (fails closed)', async () => {
+  it('22a. an event naming an unknown run aborts without calling a provider', async () => {
     const { executeWorkflowRun } = await importEngine()
-    const { run } = seedRun({ organizationId: ACME })
+    const { run } = seedRun()
     const providers = makeRegistry()
 
     const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: GLOBEX },
+      { runId: 'run_does_not_exist' },
       { providers, sleep: noSleep },
     )
 
     expect(result.outcome).toBe('ABORTED')
-    expect(result.reason).toBe('run_not_visible')
+    expect(result.reason).toBe('run_not_found')
+    // The real run is untouched.
     expect(state.runs.find((r) => r.id === run.id)?.status).toBe('PENDING')
     expect((providers.ai as ReturnType<typeof makeAi>).qualify).not.toHaveBeenCalled()
   })
 
-  it('23a. an empty organization claim fails closed without touching the run', async () => {
+  it('23a. an empty runId aborts without touching anything', async () => {
     const { executeWorkflowRun } = await importEngine()
-    const { run } = seedRun()
+    seedRun()
 
     const result = await executeWorkflowRun(
-      { runId: run.id, organizationId: '' },
+      { runId: '' },
       { providers: makeRegistry(), sleep: noSleep },
     )
 
@@ -968,7 +895,7 @@ describe('Automation execution engine', () => {
     // The original run must be finished before a re-run is allowed.
     state.runs.find((r) => r.id === run.id)!.status = 'FAILED'
 
-    const rerun = await requestManualRerun(ACME, run.id)
+    const rerun = await requestManualRerun(run.id)
 
     expect(rerun.id).not.toBe(run.id)
     expect(rerun.workflowEnrollmentId).toBe(enrollment.id)
@@ -987,9 +914,9 @@ describe('Automation execution engine', () => {
     const { run } = seedRun()
     state.runs.find((r) => r.id === run.id)!.status = 'FAILED'
 
-    const rerun = await requestManualRerun(ACME, run.id)
+    const rerun = await requestManualRerun(run.id)
     const result = await executeWorkflowRun(
-      { runId: rerun.id, organizationId: ACME },
+      { runId: rerun.id },
       { providers: makeRegistry(), sleep: noSleep },
     )
 
@@ -1006,7 +933,7 @@ describe('Automation execution engine', () => {
     const { run } = seedRun()
 
     // The seeded run is still PENDING — i.e. active.
-    await expect(requestManualRerun(ACME, run.id)).rejects.toMatchObject({ code: 'CONFLICT' })
+    await expect(requestManualRerun(run.id)).rejects.toMatchObject({ code: 'CONFLICT' })
     expect(state.runs).toHaveLength(1)
     expect(emitRunRequestedMock).not.toHaveBeenCalled()
   })
@@ -1016,27 +943,19 @@ describe('Automation execution engine', () => {
     const { recoverPendingRuns } = await import('@/lib/services/workflow-recovery')
     const { run } = seedRun()
 
-    // The sweep sees the orphan (a run created but never scheduled).
-    queryRawMock.mockResolvedValue([
-      { id: run.id, organizationId: ACME, leadId: run.leadId, trigger: 'AUTOMATIC' },
-    ])
-
+    // The seeded run is PENDING and older than the (zero) threshold, so the
+    // sweep's own query finds it — no stubbing needed any more.
     const firstSweep = await recoverPendingRuns({ olderThanMs: 0 })
     expect(firstSweep).toEqual({ found: 1, reemitted: 1 })
-    expect(emitRunRequestedMock).toHaveBeenCalledWith(
-      expect.objectContaining({ runId: run.id, organizationId: ACME }),
-    )
+    expect(emitRunRequestedMock).toHaveBeenCalledWith(expect.objectContaining({ runId: run.id }))
 
     // The re-emitted event executes the run exactly once...
     const providers = makeRegistry()
-    await executeWorkflowRun({ runId: run.id, organizationId: ACME }, { providers, sleep: noSleep })
+    await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     // ...and a second sweep + duplicate delivery changes nothing.
     await recoverPendingRuns({ olderThanMs: 0 })
-    const second = await executeWorkflowRun(
-      { runId: run.id, organizationId: ACME },
-      { providers, sleep: noSleep },
-    )
+    const second = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
     expect(second.outcome).toBe('ALREADY_TERMINAL')
     expect((providers.email as ReturnType<typeof makeEmail>).send).toHaveBeenCalledTimes(1)
@@ -1068,7 +987,7 @@ describe('Automation execution engine', () => {
       enrichment.enrich.mockRejectedValue(new Error('still failing'))
 
       await executeWorkflowRun(
-        { runId: run.id, organizationId: ACME },
+        { runId: run.id },
         { providers: makeRegistry({ enrichment }), sleep: noSleep },
       )
 
@@ -1088,7 +1007,7 @@ describe('Automation execution engine', () => {
       enrichment.enrich.mockRejectedValue(new Error('always fails'))
 
       await executeWorkflowRun(
-        { runId: run.id, organizationId: ACME },
+        { runId: run.id },
         { providers: makeRegistry({ enrichment }), sleep: noSleep },
       )
 
@@ -1126,7 +1045,6 @@ describe('Automation execution engine', () => {
       queryRawMock.mockResolvedValue([
         {
           id: run.id,
-          organizationId: ACME,
           leadId: run.leadId,
           trigger: 'AUTOMATIC',
           recoveryAttempts: 0,
@@ -1153,7 +1071,6 @@ describe('Automation execution engine', () => {
       queryRawMock.mockResolvedValue([
         {
           id: run.id,
-          organizationId: ACME,
           leadId: run.leadId,
           trigger: 'AUTOMATIC',
           recoveryAttempts: 1,
@@ -1175,7 +1092,6 @@ describe('Automation execution engine', () => {
       queryRawMock.mockResolvedValue([
         {
           id: run.id,
-          organizationId: ACME,
           leadId: run.leadId,
           trigger: 'AUTOMATIC',
           recoveryAttempts: 3,
@@ -1212,7 +1128,6 @@ describe('Automation execution engine', () => {
       queryRawMock.mockResolvedValue([
         {
           id: run.id,
-          organizationId: ACME,
           leadId: run.leadId,
           trigger: 'AUTOMATIC',
           recoveryAttempts: 0,
@@ -1233,8 +1148,8 @@ describe('Automation execution engine', () => {
 
       // Two ticks read the same recoveryAttempts before either writes.
       const [first, second] = await Promise.all([
-        claimRunForRecovery(ACME, run.id, 3),
-        claimRunForRecovery(ACME, run.id, 3),
+        claimRunForRecovery(run.id, 3),
+        claimRunForRecovery(run.id, 3),
       ])
 
       const outcomes = [first.outcome, second.outcome].sort()
@@ -1244,21 +1159,18 @@ describe('Automation execution engine', () => {
       expect(run.recoveryAttempts).toBe(1)
     })
 
-    it("never leaks another tenant's stuck run through the write path", async () => {
+    it('skips a run the sweep reported but that is no longer RUNNING', async () => {
       const { recoverStuckRunningRuns } = await import('@/lib/services/workflow-recovery')
-      const { run: acmeRun } = seedRun()
-      acmeRun.status = 'RUNNING'
+      const { run } = seedRun()
+      // The staleness query saw it RUNNING; by the time the write path runs it
+      // has finished. The conditional claim must fail closed rather than
+      // resurrect a completed run.
+      run.status = 'SUCCEEDED'
 
-      // The cross-tenant read is faked here; real cross-tenant isolation of
-      // the SECURITY DEFINER function itself is proven in
-      // tests/integration/automation-execution.test.ts. What this asserts is
-      // that recovery's WRITE path stays tenant-scoped: claiming a run under
-      // the wrong organization must fail closed rather than trust the claim.
       queryRawMock.mockResolvedValue([
         {
-          id: acmeRun.id,
-          organizationId: GLOBEX,
-          leadId: acmeRun.leadId,
+          id: run.id,
+          leadId: run.leadId,
           trigger: 'AUTOMATIC',
           recoveryAttempts: 0,
         },
@@ -1266,7 +1178,7 @@ describe('Automation execution engine', () => {
 
       await recoverStuckRunningRuns()
 
-      expect(acmeRun.recoveryAttempts).toBe(0)
+      expect(run.recoveryAttempts).toBe(0)
       expect(emitRunRecoveryRequestedMock).not.toHaveBeenCalled()
     })
   })
@@ -1283,10 +1195,7 @@ describe('Automation execution engine', () => {
       expect(state.stepRuns.filter((s) => s.workflowRunId === run.id)).toHaveLength(0)
 
       const providers = makeRegistry()
-      const result = await executeWorkflowRun(
-        { runId: run.id, organizationId: ACME },
-        { providers, sleep: noSleep },
-      )
+      const result = await executeWorkflowRun({ runId: run.id }, { providers, sleep: noSleep })
 
       expect(result.runStatus).toBe('SUCCEEDED')
       expect(stepStatus(run.id, 'ENRICH')?.status).toBe('SUCCEEDED')
@@ -1317,7 +1226,7 @@ describe('Automation execution engine', () => {
 
       const enrichment = makeEnrichment()
       const result = await executeWorkflowRun(
-        { runId: run.id, organizationId: ACME },
+        { runId: run.id },
         { providers: makeRegistry({ enrichment }), sleep: noSleep },
       )
 
@@ -1346,21 +1255,21 @@ describe('Automation execution engine', () => {
         completedAt: null,
       })
 
-      const claim = await claimRunForRecovery(ACME, run.id, 3)
+      const claim = await claimRunForRecovery(run.id, 3)
       expect(claim.outcome).toBe('RECOVERED')
       if (claim.outcome !== 'RECOVERED') throw new Error('unreachable')
 
       // What the sweep emits — a distinct generation, never assumed to dedup
       // against the original event by Inngest.
       await emitRunRecoveryRequestedMock(
-        { runId: run.id, organizationId: ACME, leadId: run.leadId, trigger: run.trigger },
+        { runId: run.id, leadId: run.leadId, trigger: run.trigger },
         claim.generation,
       )
       expect(emitRunRecoveryRequestedMock).toHaveBeenCalledWith(expect.anything(), 1)
 
       // What the Inngest function does on receiving that event: execute.
       const result = await executeWorkflowRun(
-        { runId: run.id, organizationId: ACME },
+        { runId: run.id },
         { providers: makeRegistry(), sleep: noSleep },
       )
 

@@ -12,28 +12,20 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
  * phase actually adds proof of: that flipping the column through THIS write
  * path really does change what the existing enrollment check sees).
  *
- * `@/lib/db/prisma` is an in-memory fake mimicking Prisma plus Postgres RLS,
- * same convention as tests/unit/automation-rerun.test.ts and
- * tests/unit/automation-enrollment.test.ts.
+ * `@/lib/db/prisma` is an in-memory fake mimicking Prisma, same convention as
+ * tests/unit/automation-rerun.test.ts and tests/unit/automation-enrollment.test.ts.
  */
 
-const ACME = 'org_acme'
-const GLOBEX = 'org_globex'
-
-type Row = Record<string, unknown> & { organizationId?: string }
+type Row = Record<string, unknown>
 
 const state = vi.hoisted(() => ({
-  currentOrg: null as string | null,
   role: 'ADMIN' as 'ADMIN' | 'MANAGER' | 'SALES_REP',
-  organizationId: 'org_acme',
   workflows: [] as Row[],
   runs: [] as Row[],
   leads: [] as Row[],
   enrollments: [] as Row[],
   nextId: 1,
 }))
-
-const visible = (row: Row) => row.organizationId === state.currentOrg
 
 function uniqueViolation(index: string) {
   return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
@@ -45,22 +37,16 @@ function uniqueViolation(index: string) {
 
 vi.mock('@/lib/db/prisma', () => {
   const tx = {
-    $executeRaw: async (_s: TemplateStringsArray, ...values: unknown[]) => {
-      state.currentOrg = (values[0] as string) ?? null
-      return 1
-    },
     workflow: {
       // Two independent call shapes, never overlapping: this service's own
       // `{ id }` lookups, and automation-enrollment.ts's
-      // `{ organizationId, type }` auto-provisioning lookup — the "wiring
+      // `{ type }` auto-provisioning lookup — the "wiring
       // proof" test below exercises the real, unmocked enrollment service
       // against this same fake.
       findFirst: async ({ where }: { where: Record<string, unknown> }) => {
         const found = state.workflows.find(
           (w) =>
-            visible(w) &&
             (where.id === undefined || w.id === where.id) &&
-            (where.organizationId === undefined || w.organizationId === where.organizationId) &&
             (where.type === undefined || w.type === where.type),
         )
         return found ? { ...found } : null
@@ -72,22 +58,18 @@ vi.mock('@/lib/db/prisma', () => {
         where: Record<string, unknown>
         data: Record<string, unknown>
       }) => {
-        const workflow = state.workflows.find(
-          (w) => visible(w) && w.id === where.id && w.status === where.status,
-        )
+        const workflow = state.workflows.find((w) => w.id === where.id && w.status === where.status)
         if (!workflow) return { count: 0 }
         Object.assign(workflow, data)
         return { count: 1 }
       },
       create: async ({ data }: { data: Record<string, unknown> }) => {
-        const organizationId = data.organizationId as string
         const type = data.type as string
-        if (state.workflows.some((w) => w.organizationId === organizationId && w.type === type)) {
-          throw uniqueViolation('workflows_organizationId_type_key')
+        if (state.workflows.some((w) => w.type === type)) {
+          throw uniqueViolation('workflows_type_key')
         }
         const workflow = {
           id: `wf_${state.nextId++}`,
-          organizationId,
           type,
           status: (data.status as string) ?? 'ACTIVE',
           version: (data.version as number) ?? 1,
@@ -100,15 +82,11 @@ vi.mock('@/lib/db/prisma', () => {
       findFirst: async ({ where }: { where: Record<string, unknown> }) =>
         state.leads.find(
           (l) =>
-            visible(l) &&
-            l.organizationId === where.organizationId &&
-            l.email === where.email &&
-            (where.deletedAt === null ? l.deletedAt === null : true),
+            l.email === where.email && (where.deletedAt === null ? l.deletedAt === null : true),
         ) ?? null,
       create: async ({ data }: { data: Record<string, unknown> }) => {
         const lead = {
           id: `lead_${state.nextId++}`,
-          organizationId: data.organizationId as string,
           name: data.name as string,
           email: data.email as string,
           company: (data.company as string | undefined) ?? null,
@@ -130,7 +108,7 @@ vi.mock('@/lib/db/prisma', () => {
     workflowEnrollment: {
       findFirst: async ({ where }: { where: Record<string, unknown> }) =>
         state.enrollments.find(
-          (e) => visible(e) && e.workflowId === where.workflowId && e.leadId === where.leadId,
+          (e) => e.workflowId === where.workflowId && e.leadId === where.leadId,
         ) ?? null,
       create: async ({ data }: { data: Record<string, unknown> }) => {
         const workflowId = data.workflowId as string
@@ -140,7 +118,6 @@ vi.mock('@/lib/db/prisma', () => {
         }
         const enrollment = {
           id: `enr_${state.nextId++}`,
-          organizationId: data.organizationId as string,
           workflowId,
           leadId,
           trigger: data.trigger as string,
@@ -153,7 +130,6 @@ vi.mock('@/lib/db/prisma', () => {
       findFirst: async ({ where }: { where: Record<string, unknown> }) =>
         state.runs.find(
           (r) =>
-            visible(r) &&
             (where.id === undefined || r.id === where.id) &&
             (where.workflowEnrollmentId === undefined ||
               r.workflowEnrollmentId === where.workflowEnrollmentId) &&
@@ -179,7 +155,6 @@ vi.mock('@/lib/db/prisma', () => {
         }
         const run = {
           id: `run_${state.nextId++}`,
-          organizationId: data.organizationId as string,
           workflowId: data.workflowId as string,
           workflowEnrollmentId: enrollmentId,
           leadId,
@@ -194,7 +169,7 @@ vi.mock('@/lib/db/prisma', () => {
   }
 
   return {
-    prisma: { $transaction: async (fn: (client: unknown) => Promise<unknown>) => fn(tx) },
+    prisma: { ...tx, $transaction: async (fn: (client: unknown) => Promise<unknown>) => fn(tx) },
   }
 })
 
@@ -203,7 +178,7 @@ vi.mock('@/lib/auth/session', () => ({
     const { hasCapability } = await import('@/lib/auth/rbac')
     const { ForbiddenError } = await import('@/lib/errors')
     if (!hasCapability(state.role, capability as never)) throw new ForbiddenError()
-    return { id: 'user_1', organizationId: state.organizationId, role: state.role }
+    return { id: 'user_1', role: state.role }
   },
 }))
 
@@ -218,34 +193,25 @@ async function service() {
   return import('@/lib/services/automation-workflow-status')
 }
 
-function seedWorkflow(options: {
-  id: string
-  organizationId: string
-  status: 'ACTIVE' | 'PAUSED'
-  type?: string
-}) {
+function seedWorkflow(options: { id: string; status: 'ACTIVE' | 'PAUSED'; type?: string }) {
   state.workflows.push({
     id: options.id,
-    organizationId: options.organizationId,
     status: options.status,
     type: options.type ?? 'LEAD_QUALIFICATION',
     version: 1,
   })
 }
 
-function seedRun(options: { id: string; organizationId: string; status: string }) {
+function seedRun(options: { id: string; status: string }) {
   state.runs.push({
     id: options.id,
-    organizationId: options.organizationId,
     status: options.status,
   })
 }
 
 beforeEach(() => {
   vi.clearAllMocks()
-  state.currentOrg = null
   state.role = 'ADMIN'
-  state.organizationId = ACME
   state.workflows = []
   state.runs = []
   state.leads = []
@@ -255,7 +221,7 @@ beforeEach(() => {
 
 describe('pause/resume — authorisation', () => {
   it('refuses SALES_REP', async () => {
-    seedWorkflow({ id: 'wf_1', organizationId: ACME, status: 'ACTIVE' })
+    seedWorkflow({ id: 'wf_1', status: 'ACTIVE' })
     state.role = 'SALES_REP'
     const { pauseWorkflowForCurrentUser } = await service()
 
@@ -264,7 +230,7 @@ describe('pause/resume — authorisation', () => {
   })
 
   it('allows ADMIN', async () => {
-    seedWorkflow({ id: 'wf_1', organizationId: ACME, status: 'ACTIVE' })
+    seedWorkflow({ id: 'wf_1', status: 'ACTIVE' })
     state.role = 'ADMIN'
     const { pauseWorkflowForCurrentUser } = await service()
 
@@ -272,7 +238,7 @@ describe('pause/resume — authorisation', () => {
   })
 
   it('allows MANAGER', async () => {
-    seedWorkflow({ id: 'wf_1', organizationId: ACME, status: 'ACTIVE' })
+    seedWorkflow({ id: 'wf_1', status: 'ACTIVE' })
     state.role = 'MANAGER'
     const { pauseWorkflowForCurrentUser } = await service()
 
@@ -280,44 +246,30 @@ describe('pause/resume — authorisation', () => {
   })
 })
 
-describe('pause/resume — tenancy', () => {
-  it('takes the organization from the session, never a parameter', async () => {
-    seedWorkflow({ id: 'wf_acme', organizationId: ACME, status: 'ACTIVE' })
-    seedWorkflow({ id: 'wf_globex', organizationId: GLOBEX, status: 'ACTIVE' })
-    state.organizationId = ACME
-
-    const { pauseWorkflowForCurrentUser } = await service()
-    await pauseWorkflowForCurrentUser('wf_acme')
-
-    expect(state.workflows.find((w) => w.id === 'wf_acme')?.status).toBe('PAUSED')
-    expect(state.workflows.find((w) => w.id === 'wf_globex')?.status).toBe('ACTIVE')
-  })
-
-  it('cannot pause another organization’s workflow', async () => {
-    seedWorkflow({ id: 'wf_globex', organizationId: GLOBEX, status: 'ACTIVE' })
-    state.organizationId = ACME
-
-    const { pauseWorkflowForCurrentUser } = await service()
-
-    await expect(pauseWorkflowForCurrentUser('wf_globex')).rejects.toMatchObject({
-      code: 'NOT_FOUND',
-    })
-    expect(state.workflows[0]?.status).toBe('ACTIVE')
-  })
-
+describe('pause/resume — unknown workflow', () => {
   it('a non-existent workflow id is reported as not found', async () => {
-    state.organizationId = ACME
     const { pauseWorkflowForCurrentUser } = await service()
 
     await expect(pauseWorkflowForCurrentUser('wf_missing')).rejects.toMatchObject({
       code: 'NOT_FOUND',
     })
   })
+
+  it('leaves an unrelated workflow alone', async () => {
+    seedWorkflow({ id: 'wf_1', status: 'ACTIVE' })
+    seedWorkflow({ id: 'wf_2', status: 'ACTIVE', type: 'OTHER' })
+
+    const { pauseWorkflowForCurrentUser } = await service()
+    await pauseWorkflowForCurrentUser('wf_1')
+
+    expect(state.workflows.find((w) => w.id === 'wf_1')?.status).toBe('PAUSED')
+    expect(state.workflows.find((w) => w.id === 'wf_2')?.status).toBe('ACTIVE')
+  })
 })
 
 describe('pause/resume — transitions', () => {
   it('ACTIVE -> PAUSED', async () => {
-    seedWorkflow({ id: 'wf_1', organizationId: ACME, status: 'ACTIVE' })
+    seedWorkflow({ id: 'wf_1', status: 'ACTIVE' })
     const { pauseWorkflowForCurrentUser } = await service()
 
     const result = await pauseWorkflowForCurrentUser('wf_1')
@@ -326,7 +278,7 @@ describe('pause/resume — transitions', () => {
   })
 
   it('PAUSED -> ACTIVE', async () => {
-    seedWorkflow({ id: 'wf_1', organizationId: ACME, status: 'PAUSED' })
+    seedWorkflow({ id: 'wf_1', status: 'PAUSED' })
     const { resumeWorkflowForCurrentUser } = await service()
 
     const result = await resumeWorkflowForCurrentUser('wf_1')
@@ -335,8 +287,8 @@ describe('pause/resume — transitions', () => {
   })
 
   it('never touches a WorkflowRun row', async () => {
-    seedWorkflow({ id: 'wf_1', organizationId: ACME, status: 'ACTIVE' })
-    seedRun({ id: 'run_1', organizationId: ACME, status: 'RUNNING' })
+    seedWorkflow({ id: 'wf_1', status: 'ACTIVE' })
+    seedRun({ id: 'run_1', status: 'RUNNING' })
     const { pauseWorkflowForCurrentUser } = await service()
 
     await pauseWorkflowForCurrentUser('wf_1')
@@ -344,13 +296,13 @@ describe('pause/resume — transitions', () => {
     // Pausing touches Workflow.status only — a run already RUNNING (or
     // PENDING) is completely unaffected, exactly like docs/architecture.md
     // says: nothing in the execution engine reads Workflow.status at all.
-    expect(state.runs).toEqual([{ id: 'run_1', organizationId: ACME, status: 'RUNNING' }])
+    expect(state.runs).toEqual([{ id: 'run_1', status: 'RUNNING' }])
   })
 })
 
 describe('pause/resume — idempotency and concurrency', () => {
   it('pausing an already-PAUSED workflow succeeds without error (idempotent)', async () => {
-    seedWorkflow({ id: 'wf_1', organizationId: ACME, status: 'PAUSED' })
+    seedWorkflow({ id: 'wf_1', status: 'PAUSED' })
     const { pauseWorkflowForCurrentUser } = await service()
 
     await expect(pauseWorkflowForCurrentUser('wf_1')).resolves.toEqual({
@@ -360,7 +312,7 @@ describe('pause/resume — idempotency and concurrency', () => {
   })
 
   it('resuming an already-ACTIVE workflow succeeds without error (idempotent)', async () => {
-    seedWorkflow({ id: 'wf_1', organizationId: ACME, status: 'ACTIVE' })
+    seedWorkflow({ id: 'wf_1', status: 'ACTIVE' })
     const { resumeWorkflowForCurrentUser } = await service()
 
     await expect(resumeWorkflowForCurrentUser('wf_1')).resolves.toEqual({
@@ -370,7 +322,7 @@ describe('pause/resume — idempotency and concurrency', () => {
   })
 
   it('a double-click (two concurrent pause calls) results in exactly one PAUSED, both report success', async () => {
-    seedWorkflow({ id: 'wf_1', organizationId: ACME, status: 'ACTIVE' })
+    seedWorkflow({ id: 'wf_1', status: 'ACTIVE' })
     const { pauseWorkflowForCurrentUser } = await service()
 
     const [first, second] = await Promise.all([
@@ -387,7 +339,7 @@ describe('pause/resume — idempotency and concurrency', () => {
   })
 
   it('opposite concurrent toggles (pause vs resume) leave the workflow in one well-defined state', async () => {
-    seedWorkflow({ id: 'wf_1', organizationId: ACME, status: 'ACTIVE' })
+    seedWorkflow({ id: 'wf_1', status: 'ACTIVE' })
     const { pauseWorkflowForCurrentUser, resumeWorkflowForCurrentUser } = await service()
 
     const [pauseResult, resumeResult] = await Promise.all([
@@ -405,7 +357,7 @@ describe('pause/resume — idempotency and concurrency', () => {
 
 describe('pause/resume — wiring proof against the real (unmocked) enrollment service', () => {
   it('PAUSED, set through this service, blocks a new AUTOMATIC enrollment end to end', async () => {
-    seedWorkflow({ id: 'wf_1', organizationId: ACME, status: 'ACTIVE' })
+    seedWorkflow({ id: 'wf_1', status: 'ACTIVE' })
     const { pauseWorkflowForCurrentUser } = await service()
     const { captureAutomaticLead } = await import('@/lib/services/automation-enrollment')
 
@@ -415,7 +367,7 @@ describe('pause/resume — wiring proof against the real (unmocked) enrollment s
     // rule (`if (workflow.status !== 'ACTIVE') return null`) is proven in
     // tests/unit/automation-enrollment.test.ts; this proves THIS service is
     // what actually flips the column that rule reads.
-    const result = await captureAutomaticLead(ACME, {
+    const result = await captureAutomaticLead({
       name: 'Jane Prospect',
       email: 'jane@prospect.test',
       source: 'WEBSITE_FORM',
@@ -428,13 +380,13 @@ describe('pause/resume — wiring proof against the real (unmocked) enrollment s
   })
 
   it('resuming (ACTIVE), set through this service, lets AUTOMATIC enrollment through again', async () => {
-    seedWorkflow({ id: 'wf_1', organizationId: ACME, status: 'PAUSED' })
+    seedWorkflow({ id: 'wf_1', status: 'PAUSED' })
     const { resumeWorkflowForCurrentUser } = await service()
     const { captureAutomaticLead } = await import('@/lib/services/automation-enrollment')
 
     await resumeWorkflowForCurrentUser('wf_1')
 
-    const result = await captureAutomaticLead(ACME, {
+    const result = await captureAutomaticLead({
       name: 'Jane Prospect',
       email: 'jane@prospect.test',
       source: 'WEBSITE_FORM',

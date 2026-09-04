@@ -12,13 +12,11 @@ export function AppSidebar({
   userName,
   userEmail,
   roleLabel,
-  organizationName,
 }: {
   allowedHrefs: readonly string[]
   userName: string
   userEmail: string
   roleLabel: string
-  organizationName: string
 }) {
   return (
     <aside className="bg-sidebar border-sidebar-border flex w-64 shrink-0 flex-col border-r">
@@ -29,9 +27,6 @@ export function AppSidebar({
         <span className="min-w-0">
           <span className="text-sidebar-accent-foreground block truncate text-[15px] font-semibold">
             LeadFlow AI
-          </span>
-          <span className="text-sidebar-foreground/70 block truncate text-xs">
-            {organizationName}
           </span>
         </span>
       </div>

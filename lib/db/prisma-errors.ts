@@ -47,10 +47,10 @@ export function isUniqueConstraintViolation(
 
 /** The unique constraints the automation code handles by name. */
 export const UNIQUE_CONSTRAINTS = {
-  leadEmail: { columns: ['email'], indexName: 'leads_organizationId_email_key' },
-  workflowPerOrg: {
-    columns: ['organizationId', 'type'],
-    indexName: 'workflows_organizationId_type_key',
+  leadEmail: { columns: ['email'], indexName: 'leads_email_key' },
+  workflowType: {
+    columns: ['type'],
+    indexName: 'workflows_type_key',
   },
   enrollmentPerWorkflowLead: {
     columns: ['workflowId', 'leadId'],

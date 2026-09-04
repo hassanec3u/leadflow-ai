@@ -21,31 +21,19 @@ import type { WorkflowRunTrigger } from '@prisma/client'
  *    already-running or finished run does nothing;
  *  - every step short-circuits on its own terminal row.
  *
- * WHY A SECURITY DEFINER READ:
- * this sweep is inherently cross-tenant (it does not know which organizations
- * have orphans), while every automation table is under FORCE ROW LEVEL
- * SECURITY and `workflow_runs` is only visible with a tenant context set.
- * Rather than weaken that policy, the sweep calls one narrow SECURITY DEFINER
- * function — `automation_pending_runs_for_recovery` — that returns ONLY the
- * ids needed to re-emit, ONLY for PENDING runs older than the threshold,
- * capped in size. It is the same pattern, and the same constraints, as the
- * pre-authentication lookup in lib/auth/auth-lookup.ts; provisioning lives in
- * prisma/manual/002_provision_automation_recovery_role.sql. Execution itself
- * still goes through the ordinary, fully RLS-enforced path: the engine
- * re-verifies the organization against the run before doing anything.
+ * This sweep reads `workflow_runs` directly. While the product was
+ * multi-tenant it could not: the sweep is inherently cross-tenant (it does not
+ * know which organizations have orphans) and the table was under FORCE ROW
+ * LEVEL SECURITY, so it went through a narrow SECURITY DEFINER function owned
+ * by a dedicated NOLOGIN role. Single-tenant there is no policy to satisfy and
+ * no cross-tenant read to make, so the function, the role and the privileged
+ * provisioning step they required are all gone.
  */
 
 /** A run younger than this may simply be mid-emit; leave it alone. */
 export const PENDING_RUN_RECOVERY_THRESHOLD_MS = 2 * 60 * 1000
 
 const DEFAULT_LIMIT = 50
-
-type RecoverableRun = {
-  id: string
-  organizationId: string
-  leadId: string
-  trigger: WorkflowRunTrigger
-}
 
 export type RecoverPendingRunsResult = {
   found: number
@@ -56,27 +44,29 @@ export async function recoverPendingRuns(options?: {
   olderThanMs?: number
   limit?: number
 }): Promise<RecoverPendingRunsResult> {
-  const olderThanSeconds = Math.floor(
-    (options?.olderThanMs ?? PENDING_RUN_RECOVERY_THRESHOLD_MS) / 1000,
-  )
+  const olderThanMs = options?.olderThanMs ?? PENDING_RUN_RECOVERY_THRESHOLD_MS
   const limit = options?.limit ?? DEFAULT_LIMIT
+  const cutoff = new Date(Date.now() - olderThanMs)
 
-  const runs = await prisma.$queryRaw<RecoverableRun[]>`
-    SELECT * FROM automation_pending_runs_for_recovery(${olderThanSeconds}::int, ${limit}::int)
-  `
+  const runs = await prisma.workflowRun.findMany({
+    where: { status: 'PENDING', createdAt: { lt: cutoff } },
+    select: { id: true, leadId: true, trigger: true },
+    // Oldest first: the longest-orphaned run is the one most worth rescuing
+    // when the limit truncates the sweep.
+    orderBy: { createdAt: 'asc' },
+    take: limit,
+  })
 
   let reemitted = 0
   for (const run of runs) {
     try {
       await emitRunRequested({
         runId: run.id,
-        organizationId: run.organizationId,
         leadId: run.leadId,
         trigger: run.trigger,
       })
       reemitted++
       logger.info('Re-emitted orphaned automation run', {
-        orgId: run.organizationId,
         runId: run.id,
         leadId: run.leadId,
         status: 'PENDING',
@@ -84,7 +74,6 @@ export async function recoverPendingRuns(options?: {
     } catch (error) {
       // One bad emit must not abort the sweep — the next pass retries it.
       logger.error('Failed to re-emit orphaned automation run', {
-        orgId: run.organizationId,
         runId: run.id,
         cause: error,
       })
@@ -95,9 +84,8 @@ export async function recoverPendingRuns(options?: {
 }
 
 /**
- * Recovery for WorkflowRun rows stuck RUNNING (separate mechanism from the
- * PENDING sweep above — see prisma/manual/004's design note for why this is
- * a distinct SECURITY DEFINER exception rather than a broadened one).
+ * Recovery for WorkflowRun rows stuck RUNNING — a separate mechanism from the
+ * PENDING sweep above, because it needs a different staleness signal.
  *
  * =============================================================================
  * WHY A RUN CAN BE STUCK RUNNING AT ALL
@@ -115,10 +103,10 @@ export async function recoverPendingRuns(options?: {
  * STALENESS SIGNAL
  * =============================================================================
  * GREATEST(run.updatedAt, MAX(updatedAt of that run's RUNNING step)), computed
- * inside `automation_running_runs_for_recovery` (prisma/manual/004). Only a
- * RUNNING step counts: a step that already reached SUCCEEDED/FAILED/etc. has
- * an updatedAt that is a historical fact, not a liveness signal. Using the
- * step-level signal (not just the run's own updatedAt, which is untouched
+ * in the query below. Only a RUNNING step counts: a step that already reached
+ * SUCCEEDED/FAILED/etc. has an updatedAt that is a historical fact, not a
+ * liveness signal. Using the step-level signal (not just the run's own
+ * updatedAt, which is untouched
  * between claimRun and finalizeRun) lets the threshold stay tight enough to
  * matter without ever mistaking a step legitimately mid-provider-call for
  * dead — see RUNNING_RUN_STALE_THRESHOLD_MS below for the margin this assumes.
@@ -159,7 +147,6 @@ const RUNNING_DEFAULT_LIMIT = 50
 
 type RecoverableRunningRun = {
   id: string
-  organizationId: string
   leadId: string
   trigger: WorkflowRunTrigger
   recoveryAttempts: number
@@ -182,8 +169,24 @@ export async function recoverStuckRunningRuns(options?: {
   const limit = options?.limit ?? RUNNING_DEFAULT_LIMIT
   const maxAttempts = options?.maxAttempts ?? MAX_RECOVERY_ATTEMPTS
 
+  // Raw SQL, not a Prisma query: the staleness signal is
+  // GREATEST(run.updatedAt, MAX(RUNNING step updatedAt)), which Prisma's query
+  // API cannot express. This is an ordinary query on the application's own
+  // role — the SECURITY DEFINER function it replaces existed only to escape
+  // RLS, not to compute anything the application could not.
   const runs = await prisma.$queryRaw<RecoverableRunningRun[]>`
-    SELECT * FROM automation_running_runs_for_recovery(${olderThanSeconds}::int, ${limit}::int)
+    SELECT r."id", r."leadId", r."trigger", r."recoveryAttempts"
+    FROM "workflow_runs" r
+    LEFT JOIN LATERAL (
+      SELECT MAX(s."updatedAt") AS last_running_step_at
+      FROM "workflow_step_runs" s
+      WHERE s."workflowRunId" = r."id" AND s."status" = 'RUNNING'
+    ) steps ON TRUE
+    WHERE r."status" = 'RUNNING'
+      AND GREATEST(r."updatedAt", COALESCE(steps.last_running_step_at, r."updatedAt"))
+          < NOW() - (${olderThanSeconds} * INTERVAL '1 second')
+    ORDER BY r."updatedAt" ASC
+    LIMIT ${limit}
   `
 
   let reemitted = 0
@@ -191,7 +194,7 @@ export async function recoverStuckRunningRuns(options?: {
 
   for (const run of runs) {
     try {
-      const claim = await claimRunForRecovery(run.organizationId, run.id, maxAttempts)
+      const claim = await claimRunForRecovery(run.id, maxAttempts)
 
       if (claim.outcome === 'NOT_RUNNING') {
         // Already resolved (finished, or another tick claimed it) — nothing
@@ -200,10 +203,9 @@ export async function recoverStuckRunningRuns(options?: {
       }
 
       if (claim.outcome === 'EXHAUSTED') {
-        await finalizeRun(run.organizationId, run.id, 'FAILED')
+        await finalizeRun(run.id, 'FAILED')
         failed++
         logger.warn('Stuck automation run exhausted recovery attempts; failed', {
-          orgId: run.organizationId,
           runId: run.id,
           leadId: run.leadId,
           recoveryAttempts: run.recoveryAttempts,
@@ -214,7 +216,6 @@ export async function recoverStuckRunningRuns(options?: {
       await emitRunRecoveryRequested(
         {
           runId: run.id,
-          organizationId: run.organizationId,
           leadId: run.leadId,
           trigger: run.trigger,
         },
@@ -222,7 +223,6 @@ export async function recoverStuckRunningRuns(options?: {
       )
       reemitted++
       logger.info('Re-requested execution of a stuck automation run', {
-        orgId: run.organizationId,
         runId: run.id,
         leadId: run.leadId,
         status: 'RUNNING',
@@ -231,7 +231,6 @@ export async function recoverStuckRunningRuns(options?: {
     } catch (error) {
       // One bad run must not abort the sweep — the next pass retries it.
       logger.error('Failed to recover a stuck automation run', {
-        orgId: run.organizationId,
         runId: run.id,
         cause: error,
       })

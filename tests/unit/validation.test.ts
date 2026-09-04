@@ -1,17 +1,25 @@
 import { describe, expect, it } from 'vitest'
 
-import { signUpSchema, slugifyOrganizationName } from '@/lib/validation/auth'
+import { createUserSchema } from '@/lib/validation/auth'
 
-describe('sign-up validation', () => {
+/**
+ * Account-creation validation.
+ *
+ * This used to cover a public sign-up schema and the organization-slug
+ * derivation that went with it. There is no public sign-up and no organization
+ * any more: accounts are provisioned by an operator (prisma/seed.ts), so what
+ * is left to pin down is the shape that seeding accepts.
+ */
+describe('account creation validation', () => {
   const valid = {
     name: 'Jane Doe',
     email: 'Jane@Example.COM',
     password: 'correct-horse-battery',
-    organizationName: 'Acme Inc.',
+    role: 'ADMIN' as const,
   }
 
   it('accepts valid input and normalises the email', () => {
-    const result = signUpSchema.safeParse(valid)
+    const result = createUserSchema.safeParse(valid)
     expect(result.success).toBe(true)
     // Normalising to lowercase matters: the email column is unique, so
     // "Jane@x.com" and "jane@x.com" must not become two accounts.
@@ -19,43 +27,21 @@ describe('sign-up validation', () => {
   })
 
   it('rejects a password below the length floor', () => {
-    const result = signUpSchema.safeParse({ ...valid, password: 'short' })
-    expect(result.success).toBe(false)
+    expect(createUserSchema.safeParse({ ...valid, password: 'short' }).success).toBe(false)
   })
 
   it('rejects a malformed email', () => {
-    const result = signUpSchema.safeParse({ ...valid, email: 'not-an-email' })
-    expect(result.success).toBe(false)
+    expect(createUserSchema.safeParse({ ...valid, email: 'not-an-email' }).success).toBe(false)
   })
 
-  it('requires an organization name', () => {
-    const result = signUpSchema.safeParse({ ...valid, organizationName: '' })
-    expect(result.success).toBe(false)
-  })
-})
-
-describe('organization slug derivation', () => {
-  it('lowercases and hyphenates', () => {
-    expect(slugifyOrganizationName('Acme Inc.')).toBe('acme-inc')
-    expect(slugifyOrganizationName('  Spaced   Out  ')).toBe('spaced-out')
+  it('requires a name', () => {
+    expect(createUserSchema.safeParse({ ...valid, name: '' }).success).toBe(false)
   })
 
-  it('strips diacritics so similar names produce a readable slug', () => {
-    expect(slugifyOrganizationName('Café Zoë')).toBe('cafe-zoe')
-  })
-
-  it('never returns an empty slug', () => {
-    // The column is unique and NOT NULL; an empty slug would collide for every
-    // organization whose name is entirely non-latin.
-    expect(slugifyOrganizationName('日本語')).toBe('org')
-    expect(slugifyOrganizationName('!!!')).toBe('org')
-  })
-
-  it('bounds slug length', () => {
-    expect(slugifyOrganizationName('a'.repeat(200)).length).toBeLessThanOrEqual(48)
-  })
-
-  it('produces URL-safe output only', () => {
-    expect(slugifyOrganizationName("O'Brien & Sons, Ltd.")).toMatch(/^[a-z0-9-]+$/)
+  it('requires a role, and only a known one', () => {
+    // The role is explicit precisely because nobody self-registers into it.
+    expect(createUserSchema.safeParse({ ...valid, role: undefined }).success).toBe(false)
+    expect(createUserSchema.safeParse({ ...valid, role: 'OWNER' }).success).toBe(false)
+    expect(createUserSchema.safeParse({ ...valid, role: 'SALES_REP' }).success).toBe(true)
   })
 })

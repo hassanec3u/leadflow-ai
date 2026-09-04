@@ -8,9 +8,8 @@ import { requestManualRerunForCurrentUser } from '@/lib/services/automation-reru
  * Server action bridging Run Detail's "Re-run Workflow" button to the Manual
  * Rerun service. Thin by design, like app/(app)/leads/actions.ts: the
  * service authorises (`automation:manage`, ADMIN + MANAGER) and enforces
- * every rerun rule; this only maps a failure to a client-safe message.
- * `organizationId` never appears here — it comes from the session inside
- * the service.
+ * every rerun rule; this only maps a failure to a client-safe message. The
+ * caller is resolved from the session inside the service.
  */
 export type RequestManualRerunActionResult =
   { ok: true; runId: string } | { ok: false; message: string }

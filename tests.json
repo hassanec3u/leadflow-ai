@@ -1,20 +1,20 @@
 {
   "version": 4,
-  "status": "phase_1_1_implemented",
-  "note": "Phase 0, Phase 1 (Core Lead Management), and Phase 1.1 (Lead business-rules closure: optional ownership, email normalization, duplicate/soft-delete semantics) tests are implemented. Full suite: 142 tests / 16 files, 131 passing, 11 failing — the 11 failures are pre-existing and unrelated to any Lead work (tests/integration/session-tenancy.test.ts and tests/integration/auth-lookup-security-definer.test.ts; auth/session infra). The focused Lead suite (tests/unit/leads-service.test.ts, tests/unit/csv.test.ts, tests/integration/lead-rls.test.ts) is 57/57 passing. Phase 1's create/search/detail/edit/delete/CSV-import/tenant-isolation flow was additionally verified manually end-to-end against real PostgreSQL (no automated browser e2e runner exists — see leads-15). Phase 2+ entries remain a plan. Runner: Vitest; database tests use PGlite (real PostgreSQL via WASM) with the project's actual migrations applied.",
+  "status": "single_tenant_migration_complete",
+  "note": "SINGLE-TENANT as of 2026-09-04: multi-tenancy was removed (see progress.md). Every entry with feature=multi-tenancy is status=removed, as are leads-7 (RLS) and leads-8 (per-org email uniqueness, now global). Full suite: 515 passing, 0 failing, 1 skipped across 32 files. The previous baseline was 630 passing / 11 failing; the 11 failures were in session-tenancy.test.ts and auth-lookup-security-definer.test.ts, both deleted with multi-tenancy, and the drop in total is roughly 115 tests that existed only to prove tenant isolation. Coverage genuinely lost and not replaced: the column grants and read-only-ness of the two SECURITY DEFINER recovery roles, which no longer exist. Phase 2+ entries remain a plan. Runner: Vitest; database tests use PGlite (real PostgreSQL via WASM) with the project actual migrations applied.",
   "runner": {
     "framework": "vitest",
     "command": "npm test",
     "projects": {
-      "node": "tests/{unit,integration}/**/*.test.ts — logic, security, database/RLS",
+      "node": "tests/{unit,integration}/**/*.test.ts — logic, security, database constraints",
       "jsdom": "tests/components/**/*.test.tsx — React components"
     },
     "lastRun": {
-      "date": "2026-09-01",
-      "files": 16,
-      "passed": 131,
-      "failed": 11,
-      "knownFailures": "session-tenancy.test.ts (5) and auth-lookup-security-definer.test.ts (6) — pre-existing, unrelated to any Lead work, not yet investigated"
+      "date": "2026-09-04",
+      "files": 32,
+      "passed": 515,
+      "failed": 0,
+      "knownFailures": "none"
     }
   },
   "suites": [
@@ -46,7 +46,7 @@
       "feature": "multi-tenancy",
       "description": "Query layer rejects/omits rows from a different org_id even when IDs are guessed",
       "priority": "high",
-      "status": "passing",
+      "status": "removed",
       "file": "tests/integration/session-tenancy.test.ts"
     },
     {
@@ -56,7 +56,7 @@
       "feature": "multi-tenancy",
       "description": "Postgres RLS policy blocks a cross-org row read/write even when the application-layer org_id filter is bypassed (e.g., a raw query missing the filter)",
       "priority": "high",
-      "status": "passing",
+      "status": "removed",
       "file": "tests/integration/rls-tenant-isolation.test.ts"
     },
     {
@@ -66,7 +66,7 @@
       "feature": "multi-tenancy",
       "description": "Every tenant table (including LeadEnrichment, AIInsight, EmailEvent, CampaignStep, WorkflowRunStep) has a non-null org_id column and an RLS policy",
       "priority": "high",
-      "status": "passing",
+      "status": "removed",
       "file": "tests/integration/rls-tenant-isolation.test.ts"
     },
     {
@@ -136,9 +136,9 @@
       "phase": 1,
       "type": "integration",
       "feature": "leads",
-      "description": "Lead table has RLS enabled and forced, with a tenant-isolation policy verified against the real (non-superuser, non-BYPASSRLS) leadflow_app role",
+      "description": "REMOVED 2026-09-04 with multi-tenancy: the leads table has no RLS. Constraint coverage moved to tests/integration/automation-domain.test.ts",
       "priority": "high",
-      "status": "passing",
+      "status": "removed",
       "file": "tests/integration/lead-rls.test.ts"
     },
     {
@@ -146,9 +146,9 @@
       "phase": 1,
       "type": "integration",
       "feature": "leads",
-      "description": "Lead email uniqueness is scoped per organization: rejected as a duplicate within the same org, allowed to repeat in a different org",
+      "description": "SUPERSEDED 2026-09-04: Lead email is now globally unique (single-tenant). Covered by tests/integration/automation-domain.test.ts",
       "priority": "high",
-      "status": "passing",
+      "status": "removed",
       "file": "tests/integration/lead-rls.test.ts"
     },
     {
@@ -683,7 +683,7 @@
       "feature": "multi-tenancy",
       "description": "A tenant cannot read, update or delete another tenant row even with the exact primary key",
       "priority": "high",
-      "status": "passing",
+      "status": "removed",
       "file": "tests/integration/rls-tenant-isolation.test.ts"
     },
     {
@@ -693,7 +693,7 @@
       "feature": "multi-tenancy",
       "description": "An INSERT attributing a row to another organization is rejected by the WITH CHECK policy",
       "priority": "high",
-      "status": "passing",
+      "status": "removed",
       "file": "tests/integration/rls-tenant-isolation.test.ts"
     },
     {
@@ -703,7 +703,7 @@
       "feature": "multi-tenancy",
       "description": "Queries with no tenant context return zero rows (fails closed, never open)",
       "priority": "high",
-      "status": "passing",
+      "status": "removed",
       "file": "tests/integration/rls-tenant-isolation.test.ts"
     },
     {
@@ -713,7 +713,7 @@
       "feature": "multi-tenancy",
       "description": "Tenant context does not leak between transactions on the same connection (pool-safe)",
       "priority": "high",
-      "status": "passing",
+      "status": "removed",
       "file": "tests/integration/rls-tenant-isolation.test.ts"
     },
     {
@@ -723,7 +723,7 @@
       "feature": "multi-tenancy",
       "description": "withTenant sets tenant context before running work, binds the org id as a parameter, and rejects an empty org id",
       "priority": "high",
-      "status": "passing",
+      "status": "removed",
       "file": "tests/unit/tenant-db.test.ts"
     },
     {
@@ -733,7 +733,7 @@
       "feature": "multi-tenancy",
       "description": "Session resolution re-reads the user from the database, so a stale token cannot retain a role or switch organization",
       "priority": "high",
-      "status": "passing",
+      "status": "removed",
       "file": "tests/integration/session-tenancy.test.ts"
     },
     {
@@ -743,7 +743,7 @@
       "feature": "multi-tenancy",
       "description": "A soft-deleted organization immediately revokes access",
       "priority": "medium",
-      "status": "passing",
+      "status": "removed",
       "file": "tests/integration/session-tenancy.test.ts"
     },
     {

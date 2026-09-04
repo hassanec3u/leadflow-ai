@@ -1,7 +1,7 @@
 import { redirect } from 'next/navigation'
 
 import { AppSidebar } from '@/components/layout/app-sidebar'
-import { getCurrentOrganization, getCurrentUser } from '@/lib/auth/session'
+import { getCurrentUser } from '@/lib/auth/session'
 import { ROLE_LABELS, hasCapability } from '@/lib/auth/rbac'
 import { NAV_ITEMS } from '@/lib/navigation'
 
@@ -10,7 +10,7 @@ import { NAV_ITEMS } from '@/lib/navigation'
  *
  * This layout performs a real auth check rather than relying on `proxy.ts`,
  * which is only an optimistic redirect. Every page beneath it therefore renders
- * for an authenticated user with a live organization.
+ * for an authenticated user.
  *
  * Note that a layout auth check does not, on its own, protect the pages
  * beneath it (layouts do not re-render on every navigation), which is why
@@ -19,11 +19,6 @@ import { NAV_ITEMS } from '@/lib/navigation'
 export default async function AppLayout({ children }: LayoutProps<'/'>) {
   const user = await getCurrentUser()
   if (!user) {
-    redirect('/login')
-  }
-
-  const organization = await getCurrentOrganization()
-  if (!organization) {
     redirect('/login')
   }
 
@@ -40,7 +35,6 @@ export default async function AppLayout({ children }: LayoutProps<'/'>) {
         userName={user.name ?? user.email}
         userEmail={user.email}
         roleLabel={ROLE_LABELS[user.role]}
-        organizationName={organization.name}
       />
       <main className="flex min-w-0 flex-1 flex-col overflow-y-auto">{children}</main>
     </div>

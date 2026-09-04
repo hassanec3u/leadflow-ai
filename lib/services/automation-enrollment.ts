@@ -1,8 +1,15 @@
 import 'server-only'
 
-import type { Lead, LeadSource, Workflow, WorkflowEnrollment, WorkflowRun } from '@prisma/client'
+import type {
+  Lead,
+  LeadSource,
+  Prisma,
+  Workflow,
+  WorkflowEnrollment,
+  WorkflowRun,
+} from '@prisma/client'
 
-import { withTenant, type TenantDb } from '@/lib/db/tenant'
+import { prisma } from '@/lib/db/prisma'
 import { isUniqueConstraintViolation, UNIQUE_CONSTRAINTS } from '@/lib/db/prisma-errors'
 import { AppError, ConflictError, ValidationError } from '@/lib/errors'
 import { logger } from '@/lib/logger'
@@ -16,24 +23,16 @@ import {
  * Server-side Automatic Workflow Enrollment service (Phase 2B).
  *
  * Scope, deliberately narrow (docs/roadmap.md Phase 2B): decide whether a
- * Lead is eligible for automatic enrollment into the organization's single
- * fixed `LEAD_QUALIFICATION` workflow (docs/architecture.md §10) and, if so,
- * create the `WorkflowEnrollment` row. This module does NOT execute the
- * pipeline: it never creates a `WorkflowRun`, never calls a provider, and
- * never sends anything. Execution is Phase 2C+ (Inngest).
+ * Lead is eligible for automatic enrollment into the single fixed
+ * `LEAD_QUALIFICATION` workflow (docs/architecture.md §10) and, if so, create
+ * the `WorkflowEnrollment` row.
  *
- * Tenancy: every exported function takes `organizationId` as an explicit
- * parameter rather than resolving it via `requireUser()`. Automatic
- * enrollment is triggered by an automatic capture source (a Website Form
- * submission, docs/product-spec.md §8) — there is no signed-in LeadFlow user
- * in that request. The caller is trusted to have already resolved
- * `organizationId` through its own mechanism (the current caller in this
- * codebase is a test; a future public capture endpoint would resolve it from
- * a per-org webhook/API-key secret, never from the request body — see
- * docs/architecture.md §6). `organizationId` is NEVER read out of the raw
- * incoming payload (`rawInput` below) — only validated lead fields are.
- * Every query still runs through `withTenant()`, so Postgres RLS remains the
- * backstop exactly as it is for every other tenant-owned table.
+ * There is no signed-in user on this path: enrollment is triggered by an
+ * automatic capture source (a Website Form submission, docs/product-spec.md
+ * §8). Authentication of that caller happens at the endpoint
+ * (app/api/webhooks/lead-capture/route.ts, which checks FORM_CAPTURE_SECRET);
+ * this service is reached only after that check passes, and reads nothing but
+ * validated lead fields out of the incoming payload.
  */
 
 const AUTOMATIC_ENROLLMENT_SOURCES: ReadonlySet<LeadSource> = new Set<LeadSource>(['WEBSITE_FORM'])
@@ -53,7 +52,7 @@ export function isEligibleForAutomaticEnrollment(source: LeadSource): boolean {
 // than re-implemented per service: the Prisma/driver-adapter error shapes are
 // fiddly enough that one tested implementation is the only safe number.
 const isUniqueWorkflowViolation = (error: unknown) =>
-  isUniqueConstraintViolation(error, UNIQUE_CONSTRAINTS.workflowPerOrg)
+  isUniqueConstraintViolation(error, UNIQUE_CONSTRAINTS.workflowType)
 
 const isUniqueEnrollmentViolation = (error: unknown) =>
   isUniqueConstraintViolation(error, UNIQUE_CONSTRAINTS.enrollmentPerWorkflowLead)
@@ -62,35 +61,32 @@ const isUniqueLeadEmailViolation = (error: unknown) =>
   isUniqueConstraintViolation(error, UNIQUE_CONSTRAINTS.leadEmail)
 
 /**
- * Find the organization's single `LEAD_QUALIFICATION` workflow, creating it
- * if it does not exist yet.
+ * Find the single `LEAD_QUALIFICATION` workflow, creating it if it does not
+ * exist yet.
  *
- * Nothing currently provisions this row at organization creation
- * (docs/architecture.md §10 describes that as the eventual behavior, but it
- * is not built — see lib/services/signup.ts). Enrollment is the first thing
- * that needs the row to exist, so it lazily creates it here — find-then-create,
- * with a race caught by the `(organizationId, type)` unique constraint and
- * resolved by re-reading, so concurrent first-enrollments for the same org
- * can never create two workflow rows (rule: "do not create multiple
- * LEAD_QUALIFICATION workflows for one organization").
+ * Nothing provisions this row up front (docs/architecture.md §10 describes
+ * that as the eventual behavior, but it is not built). Enrollment is the first
+ * thing that needs the row to exist, so it lazily creates it here —
+ * find-then-create, with a race caught by the `(type)` unique constraint and
+ * resolved by re-reading, so concurrent first-enrollments can never create two
+ * workflow rows.
  */
 async function getOrCreateLeadQualificationWorkflow(
-  tx: TenantDb,
-  organizationId: string,
+  tx: Prisma.TransactionClient,
 ): Promise<Workflow> {
   const existing = await tx.workflow.findFirst({
-    where: { organizationId, type: 'LEAD_QUALIFICATION' },
+    where: { type: 'LEAD_QUALIFICATION' },
   })
   if (existing) return existing
 
   try {
     return await tx.workflow.create({
-      data: { organizationId, type: 'LEAD_QUALIFICATION', status: 'ACTIVE', version: 1 },
+      data: { type: 'LEAD_QUALIFICATION', status: 'ACTIVE', version: 1 },
     })
   } catch (error) {
     if (isUniqueWorkflowViolation(error)) {
       const workflow = await tx.workflow.findFirst({
-        where: { organizationId, type: 'LEAD_QUALIFICATION' },
+        where: { type: 'LEAD_QUALIFICATION' },
       })
       if (workflow) return workflow
     }
@@ -99,9 +95,9 @@ async function getOrCreateLeadQualificationWorkflow(
 }
 
 /**
- * Enroll `lead` into the organization's workflow if — and only if — it is
- * eligible. Returns the (possibly pre-existing) enrollment, or `null` when no
- * enrollment was made.
+ * Enroll `lead` into the workflow if — and only if — it is eligible. Returns
+ * the (possibly pre-existing) enrollment, or `null` when no enrollment was
+ * made.
  *
  * Idempotent and concurrency-safe: a lead already enrolled in this workflow
  * returns that same enrollment rather than erroring or duplicating, whether
@@ -117,15 +113,14 @@ async function getOrCreateLeadQualificationWorkflow(
  * simply never revisited.
  */
 async function enrollLeadIfEligible(
-  tx: TenantDb,
-  organizationId: string,
+  tx: Prisma.TransactionClient,
   lead: Lead,
 ): Promise<{ enrollment: WorkflowEnrollment; workflow: Workflow } | null> {
   if (!isEligibleForAutomaticEnrollment(lead.source)) {
     return null
   }
 
-  const workflow = await getOrCreateLeadQualificationWorkflow(tx, organizationId)
+  const workflow = await getOrCreateLeadQualificationWorkflow(tx)
   if (workflow.status !== 'ACTIVE') {
     return null
   }
@@ -140,7 +135,6 @@ async function enrollLeadIfEligible(
   try {
     const enrollment = await tx.workflowEnrollment.create({
       data: {
-        organizationId,
         workflowId: workflow.id,
         leadId: lead.id,
         trigger: 'AUTOMATIC',
@@ -172,8 +166,7 @@ async function enrollLeadIfEligible(
  * updates the Lead and starts nothing.
  */
 async function createPendingRunForEnrollment(
-  tx: TenantDb,
-  organizationId: string,
+  tx: Prisma.TransactionClient,
   lead: Lead,
   enrollment: WorkflowEnrollment,
   workflow: Workflow,
@@ -186,7 +179,6 @@ async function createPendingRunForEnrollment(
   try {
     return await tx.workflowRun.create({
       data: {
-        organizationId,
         workflowId: workflow.id,
         workflowEnrollmentId: enrollment.id,
         leadId: lead.id,
@@ -233,7 +225,7 @@ function nonDestructiveUpdate(existing: Lead, incoming: AutomaticLeadCaptureInpu
 
 export type CaptureAutomaticLeadResult = {
   lead: Lead
-  /** false when an existing Lead (by normalized, org-scoped email) was updated instead of created. */
+  /** false when an existing Lead (by normalized email) was updated instead of created. */
   leadWasCreated: boolean
   /** null when the lead's source is not eligible, or the workflow is paused. */
   enrollment: WorkflowEnrollment | null
@@ -250,11 +242,11 @@ export type CaptureAutomaticLeadResult = {
  *
  * This is the one entry point that implements the full "duplicate incoming
  * lead" rule end to end:
- *  - a normalized-email match against an existing (non-deleted) Lead in the
- *    same organization updates that Lead non-destructively — it never
- *    creates a second Lead, and (because enrollment is looked up by
- *    `(workflowId, leadId)`, which is stable across repeat calls for the
- *    same Lead) never creates a second enrollment or a second workflow run.
+ *  - a normalized-email match against an existing (non-deleted) Lead updates
+ *    that Lead non-destructively — it never creates a second Lead, and
+ *    (because enrollment is looked up by `(workflowId, leadId)`, which is
+ *    stable across repeat calls for the same Lead) never creates a second
+ *    enrollment or a second workflow run.
  *  - no match creates a new Lead.
  *
  * Phase 2C: a fresh enrollment also gets a PENDING `WorkflowRun` created in
@@ -264,18 +256,10 @@ export type CaptureAutomaticLeadResult = {
  * the row it names, while a row created without an event would simply never
  * run, which is why an emit failure is logged and left to the reconciler
  * (lib/services/workflow-recovery.ts) rather than failing the capture.
- *
- * `organizationId` is a trusted parameter, never read from `rawInput` — see
- * the module doc comment above.
  */
 export async function captureAutomaticLead(
-  organizationId: string,
   rawInput: unknown,
 ): Promise<CaptureAutomaticLeadResult> {
-  if (!organizationId) {
-    throw new Error('captureAutomaticLead requires a non-empty organizationId')
-  }
-
   const parsed = automaticLeadCaptureSchema.safeParse(rawInput)
   if (!parsed.success) {
     throw new ValidationError(
@@ -288,14 +272,17 @@ export async function captureAutomaticLead(
   let result: CaptureAutomaticLeadResult
 
   try {
-    result = await withTenant(organizationId, async (tx) => {
+    // One transaction for the whole capture: the Lead, its enrollment and the
+    // PENDING run are durable together or not at all. This is what lets the
+    // event be emitted after commit knowing the row it names exists.
+    result = await prisma.$transaction(async (tx) => {
       // Not filtered to eligible sources here: capture itself accepts any
       // LeadSource (e.g. a future webhook source), and eligibility is
       // decided once, in enrollLeadIfEligible, via
       // isEligibleForAutomaticEnrollment — the single source of truth, not
       // duplicated into this lookup.
       const existing = await tx.lead.findFirst({
-        where: { organizationId, email: input.email, deletedAt: null },
+        where: { email: input.email, deletedAt: null },
       })
 
       let lead: Lead
@@ -310,7 +297,6 @@ export async function captureAutomaticLead(
       } else {
         lead = await tx.lead.create({
           data: {
-            organizationId,
             name: input.name,
             email: input.email,
             company: input.company,
@@ -326,14 +312,13 @@ export async function captureAutomaticLead(
         leadWasCreated = true
       }
 
-      const enrolled = await enrollLeadIfEligible(tx, organizationId, lead)
+      const enrolled = await enrollLeadIfEligible(tx, lead)
       if (!enrolled) {
         return { lead, leadWasCreated, enrollment: null, run: null }
       }
 
       const run = await createPendingRunForEnrollment(
         tx,
-        organizationId,
         lead,
         enrolled.enrollment,
         enrolled.workflow,
@@ -345,14 +330,14 @@ export async function captureAutomaticLead(
     if (isUniqueLeadEmailViolation(error)) {
       // The only way to reach this despite the findFirst above: the sole
       // existing row with this email is soft-deleted (deletedAt excluded it
-      // from the lookup), and the DB's (organizationId, email) uniqueness is
-      // NOT deletedAt-filtered (Phase 1.1) — so a soft-deleted Lead still
-      // blocks a new insert with the same email, same as manual creation.
-      throw new ConflictError('A lead with that email already exists in your organization.')
+      // from the lookup), and the DB's `email` uniqueness is NOT
+      // deletedAt-filtered (Phase 1.1) — so a soft-deleted Lead still blocks a
+      // new insert with the same email, same as manual creation.
+      throw new ConflictError('A lead with that email already exists.')
     }
     if (error instanceof AppError) throw error
 
-    logger.error('Failed to capture automatic lead', { organizationId, cause: error })
+    logger.error('Failed to capture automatic lead', { cause: error })
     throw error
   }
 
@@ -362,7 +347,6 @@ export async function captureAutomaticLead(
     try {
       await emitRunRequested({
         runId: result.run.id,
-        organizationId,
         leadId: result.lead.id,
         trigger: 'AUTOMATIC',
       })
@@ -372,7 +356,6 @@ export async function captureAutomaticLead(
       // rather than losing it. Failing the capture here would be worse: the
       // lead is already saved and the caller has nothing useful to retry.
       logger.error('Failed to emit automation run event after capture', {
-        orgId: organizationId,
         runId: result.run.id,
         leadId: result.lead.id,
         cause: error,

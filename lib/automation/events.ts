@@ -7,21 +7,15 @@ import { inngest } from '@/lib/inngest/client'
 /**
  * The automation event contract (Phase 2C).
  *
- * Exactly one event drives execution. `runId` is the authoritative handle:
- * every other field is either observability or a CLAIM that the engine
- * re-verifies against the database under RLS before acting on it.
- *
- * `organizationId` in particular is never trusted. The engine loads the run
- * by id inside `withTenant(claimedOrganizationId)`; if the pair does not
- * match, RLS returns zero rows and execution aborts. A forged or stale
- * payload therefore cannot execute against another tenant — it fails closed.
+ * Exactly one event drives execution. `runId` is the authoritative handle;
+ * every other field is observability. The engine loads the run by id and
+ * reads everything it acts on from that row, never from the payload — so a
+ * forged or stale event can at worst re-request a run that already exists.
  */
 export const AUTOMATION_RUN_REQUESTED = 'automation/run.requested' as const
 
 export type AutomationRunRequestedData = {
   runId: string
-  /** Claim only — verified against the run under RLS (see above). */
-  organizationId: string
   /** Observability only; the engine reads the authoritative lead from the run. */
   leadId: string
   trigger: WorkflowRunTrigger

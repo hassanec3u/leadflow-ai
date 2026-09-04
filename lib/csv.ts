@@ -2,9 +2,8 @@
  * Minimal CSV parsing for Lead import (Phase 1E).
  *
  * Pure text -> rows transformation — no DB/session access, no business logic.
- * Deliberately does not accept an `organizationId` (or any tenant-identifying)
- * column: an unrecognized header is rejected outright, so a CSV can never
- * smuggle a tenant id in even if a client tried to add one.
+ * An unrecognized header is rejected outright, so a CSV can never smuggle an
+ * extra column into the import.
  */
 
 const REQUIRED_HEADERS = ['name', 'email'] as const

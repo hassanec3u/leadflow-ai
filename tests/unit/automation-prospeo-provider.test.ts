@@ -528,7 +528,7 @@ describe('contract compatibility', () => {
     // Honoured as part of the contract. Prospeo documents no native
     // idempotency for this endpoint, so nothing more is claimed here.
     await expect(
-      provider.enrich({ idempotencyKey: 'step_42', organizationId: 'org_1', lead }),
+      provider.enrich({ idempotencyKey: 'step_42', lead }),
     ).resolves.toHaveProperty('provider', 'prospeo')
   })
 })

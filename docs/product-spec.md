@@ -4,7 +4,7 @@ Status: Draft v1 (pre-implementation). Source: dashboard screenshot ("AI Lead Qu
 
 ## 1. Product Summary
 
-LeadFlow AI is a multi-tenant SaaS "full revenue platform": it captures leads from multiple sources, enriches them, uses AI to score/qualify and summarize intent, automates personalized follow-up email, syncs to a CRM, and notifies the sales team — with a dashboard for pipeline visibility and reporting.
+LeadFlow AI is a "full revenue platform": it captures leads from multiple sources, enriches them, uses AI to score/qualify and summarize intent, automates personalized follow-up email, syncs to a CRM, and notifies the sales team — with a dashboard for pipeline visibility and reporting.
 
 **Primary users:** SMB / agency sales & marketing teams (assumed — see Open Questions). Roles: Administrator, Manager, Sales Rep.
 
@@ -25,7 +25,7 @@ LeadFlow AI is a multi-tenant SaaS "full revenue platform": it captures leads fr
 
 **Assumptions (pending confirmation, unrelated to the vendor question above):**
 
-- Multi-tenant SaaS, one workspace ("Organization") per customer, org-scoped data isolation.
+- Single-tenant: one deployment serves one company. (This was multi-tenant through Phase 2; see architecture.md §4 for what was removed and why.)
 - Stack: Next.js (App Router) + TypeScript, PostgreSQL + Prisma, background job queue for async workflow steps, hosted on Vercel + a managed Postgres (Supabase/Neon).
 
 **Integration extensibility principle:** every third-party integration (confirmed or not) is implemented behind a common provider interface (see `docs/architecture.md` §3/§9) so an unconfirmed choice (enrichment, email) can be swapped in later without redesigning the pipeline, and a confirmed one (Airtable, Slack, OpenAI) is not hard-baked in a way that blocks adding alternatives.
@@ -66,37 +66,34 @@ LeadFlow AI is a multi-tenant SaaS "full revenue platform": it captures leads fr
 
 ## 5. Database Entities
 
-- **Organization** — tenant root: id, name, plan, created_at
-- **User** — id, org_id, email, name, role (admin/manager/sales_rep), status, created_at
-- **Organization** — add `deleted_at` (soft-delete, for org offboarding/data purge).
+- **User** — id, email, name, role (admin/manager/sales_rep), status, created_at
 - **User** — add `slack_user_id` (nullable) — resolves a LeadFlow user to a Slack identity for owner-DM notifications; without it, notifications fall back to channel-only.
-- **Lead** — id, org_id, owner_id (**nullable — a Lead may be "Unassigned"**; no fake system owner is invented and no auto-assignment to an admin happens, per Phase 1.1 business-rules closure), name, company, email (**normalized before persistence/comparison: trimmed and lowercased**, e.g. `" John@Example.COM "` → `"john@example.com"`), phone, source (website_form/webhook/linkedin/google_ads/referral/manual/csv_import), ai_score (nullable — null means "not yet scored" or "AI output failed validation, needs manual review", never a default 0), qualification (hot/warm/cold — the AI-assessed potential **bucket**; a separate concept from `status`, the sales/process **stage**, and not interchangeable with it), status (new/enriching/qualified/emailed/email_opened/replied/converted/lost), deleted_at (soft-delete — **a soft-deleted Lead remains part of the organization's data and retains its email identity**: its email cannot be reused by a second Lead in the same org), created_at, updated_at, last_action_at. **Unique constraint on `(org_id, normalized email)`** — for MVP, a duplicate means an exact match on the normalized email within the same org (no fuzzy matching, no name/company/phone heuristics); a duplicate is **rejected** (`ConflictError`), not merged or upserted, and the database constraint is the final authority — this applies identically to manual create, update, and CSV import. `status` is treated as **derived** — recomputed from the latest `WorkflowRunStep`/`EmailEvent`, never hand-set independently of those, to avoid the two staying in sync manually. Manually created and CSV-imported leads never auto-enroll in the automation pipeline (see §8) regardless of ownership state.
-- **LeadEnrichment** — id, org_id, lead_id, provider (pluggable, not yet confirmed), payload (jsonb), enriched_at
-- **AIInsight** — id, org_id, lead_id, summary, intent_keywords (jsonb array), recommended_action, recommended_action_time, model_used, prompt_version, token_usage, generated_at
-- **Campaign** — id, org_id, name, type, status, created_by, created_at
-- **CampaignStep** — id, org_id, campaign_id, step_order, subject, body_template, delay_hours
-- **EmailEvent** — id, org_id, lead_id, campaign_id, workflow_run_step_id (nullable, links a send back to the run that caused it — used for idempotency checks), type (sent/opened/replied/bounced), occurred_at
-- **Workflow** — id, org_id, name, status (active/paused), created_at. **Exactly one `Workflow` row per org for MVP**, auto-created on org signup, representing the fixed 7-step pipeline — this is a configuration record (enable/disable, thresholds), not a general multi-workflow builder (see §8 and architecture.md §10 — dropped as over-scoped for MVP).
+- **Lead** — id, owner_id (**nullable — a Lead may be "Unassigned"**; no fake system owner is invented and no auto-assignment to an admin happens, per Phase 1.1 business-rules closure), name, company, email (**normalized before persistence/comparison: trimmed and lowercased**, e.g. `" John@Example.COM "` → `"john@example.com"`), phone, source (website_form/webhook/linkedin/google_ads/referral/manual/csv_import), ai_score (nullable — null means "not yet scored" or "AI output failed validation, needs manual review", never a default 0), qualification (hot/warm/cold — the AI-assessed potential **bucket**; a separate concept from `status`, the sales/process **stage**, and not interchangeable with it), status (new/enriching/qualified/emailed/email_opened/replied/converted/lost), deleted_at (soft-delete — **a soft-deleted Lead retains its email identity**: its email cannot be reused by a second Lead), created_at, updated_at, last_action_at. **Unique constraint on the normalized `email`** — for MVP, a duplicate means an exact match on the normalized email (no fuzzy matching, no name/company/phone heuristics); a duplicate is **rejected** (`ConflictError`), not merged or upserted, and the database constraint is the final authority — this applies identically to manual create, update, and CSV import. `status` is treated as **derived** — recomputed from the latest `WorkflowRunStep`/`EmailEvent`, never hand-set independently of those, to avoid the two staying in sync manually. Manually created and CSV-imported leads never auto-enroll in the automation pipeline (see §8) regardless of ownership state.
+- **LeadEnrichment** — id, lead_id, provider (pluggable, not yet confirmed), payload (jsonb), enriched_at
+- **AIInsight** — id, lead_id, summary, intent_keywords (jsonb array), recommended_action, recommended_action_time, model_used, prompt_version, token_usage, generated_at
+- **Campaign** — id, name, type, status, created_by, created_at
+- **CampaignStep** — id, campaign_id, step_order, subject, body_template, delay_hours
+- **EmailEvent** — id, lead_id, campaign_id, workflow_run_step_id (nullable, links a send back to the run that caused it — used for idempotency checks), type (sent/opened/replied/bounced), occurred_at
+- **Workflow** — id, name, status (active/paused), created_at. **Exactly one `Workflow` row for MVP**, auto-provisioned on first capture, representing the fixed 7-step pipeline — this is a configuration record (enable/disable, thresholds), not a general multi-workflow builder (see §8 and architecture.md §10 — dropped as over-scoped for MVP).
 - **WorkflowStep** — id, workflow_id, step_order, type (enrich_data/ai_qualification/score_tag/add_to_crm/send_email/notify_team), config (jsonb) — seeded from a fixed list at org creation; not user-creatable.
-- **WorkflowRun** — id, org_id, workflow_id, lead_id, dedup_key (unique — derived from the triggering event, prevents a duplicate webhook delivery from starting a second run for the same lead), status (pending/running/succeeded/failed/**blocked**), started_at, completed_at
-- **WorkflowRunStep** — id, org_id, workflow_run_id, workflow_step_id, status (pending/running/succeeded/failed/skipped), output (jsonb), occurred_at
-- **Integration** — id, org_id, provider (confirmed: openai/airtable/slack; pluggable/TBD: enrichment_provider/email_provider; capture sources: google_ads/linkedin), status (connected/disconnected/error), credentials_encrypted, config (jsonb), connected_at
-- **Notification** — id, org_id, user_id, type, payload (jsonb), read_at, created_at
-- **DailyMetric** — id, org_id, date, total_leads, hot_leads, warm_leads, cold_leads, emails_sent, replies, reply_rate (materialized rollup for **completed days only**; the current day is computed live — see architecture.md §7)
-- **AuditLog** — id, org_id, actor_id, action, entity_type, entity_id, metadata (jsonb), created_at
-- **ApiKey** — id, org_id, key_hash, label, created_at, last_used_at
+- **WorkflowRun** — id, workflow_id, lead_id, dedup_key (unique — derived from the triggering event, prevents a duplicate webhook delivery from starting a second run for the same lead), status (pending/running/succeeded/failed/**blocked**), started_at, completed_at
+- **WorkflowRunStep** — id, workflow_run_id, workflow_step_id, status (pending/running/succeeded/failed/skipped), output (jsonb), occurred_at
+- **Integration** — id, provider (confirmed: openai/airtable/slack; pluggable/TBD: enrichment_provider/email_provider; capture sources: google_ads/linkedin), status (connected/disconnected/error), credentials_encrypted, config (jsonb), connected_at
+- **Notification** — id, user_id, type, payload (jsonb), read_at, created_at
+- **DailyMetric** — id, date, total_leads, hot_leads, warm_leads, cold_leads, emails_sent, replies, reply_rate (materialized rollup for **completed days only**; the current day is computed live — see architecture.md §7)
+- **AuditLog** — id, actor_id, action, entity_type, entity_id, metadata (jsonb), created_at
+- **ApiKey** — id, key_hash, label, created_at, last_used_at
 
-**`org_id` is denormalized onto every tenant-owned table above** (including ones reachable only via a join, like `LeadEnrichment`/`AIInsight`/`EmailEvent`/`CampaignStep`/`WorkflowRunStep`) specifically so Postgres RLS can be enforced on all of them independently — see architecture.md §4.
+There is no `org_id` on any table and no Postgres RLS: the product is single-tenant. Access control is the RBAC matrix (§11) plus the Lead ownership scope — see architecture.md §4.
 
 ## 6. Relationships
 
-- Organization 1—N { User, Lead, Campaign, Workflow, Integration, Notification, DailyMetric, AuditLog, ApiKey }
 - Lead N—1 User (owner); Lead 1—N { LeadEnrichment, AIInsight, EmailEvent, WorkflowRun }; Lead N—1 Campaign (current, optional)
 - Campaign 1—N { CampaignStep, EmailEvent }
 - Workflow 1—N { WorkflowStep, WorkflowRun }
 - WorkflowRun N—1 Lead; WorkflowRun 1—N WorkflowRunStep; WorkflowRunStep N—1 WorkflowStep
 
-All tenant-owned tables carry `org_id` for isolation (enforced at query layer + Postgres RLS).
+Access is scoped in application code only — see architecture.md §4.
 
 ## 7. API Routes (REST)
 
@@ -112,7 +109,7 @@ All tenant-owned tables carry `org_id` for isolation (enforced at query layer + 
 
 **Campaigns:** `GET/POST /api/campaigns`, `GET/PATCH/DELETE /api/campaigns/:id`, `POST /api/campaigns/:id/send`
 
-**Automation (single fixed pipeline per org — no create/delete; it's auto-provisioned):** `GET /api/automation`, `PATCH /api/automation` (per-step config/thresholds), `POST /api/automation/toggle`, `GET /api/automation/runs`, `POST /api/automation/runs/:runId/retry`
+**Automation (a single fixed pipeline — no create/delete; it's auto-provisioned):** `GET /api/automation`, `PATCH /api/automation` (per-step config/thresholds), `POST /api/automation/toggle`, `GET /api/automation/runs`, `POST /api/automation/runs/:runId/retry`
 
 **Integrations:** `GET /api/integrations`, `POST /api/integrations/:provider/connect`, `DELETE /api/integrations/:provider`, `POST /api/integrations/:provider/test`
 
@@ -122,7 +119,7 @@ All tenant-owned tables carry `org_id` for isolation (enforced at query layer + 
 
 ## 8. Workflows (business process)
 
-**Scope note:** this is a single fixed pipeline per org (matches the screenshot's one "Active / All automations are running" status and one workflow link) — not a general multi-workflow builder. Building support for multiple, user-configurable workflows was flagged as over-engineering in the architecture review and is explicitly out of MVP scope (see architecture.md §10).
+**Scope note:** this is a single fixed pipeline (matches the screenshot's one "Active / All automations are running" status and one workflow link) — not a general multi-workflow builder. Building support for multiple, user-configurable workflows was flagged as over-engineering in the architecture review and is explicitly out of MVP scope (see architecture.md §10).
 
 **Enrollment policy:** only leads captured via **webhook/form/ad source** auto-enroll in this pipeline. Manually entered or CSV-imported leads are created in `status=new` **without** triggering the pipeline (no automated email is sent on their behalf) — a rep must explicitly choose "Run automation" for that lead. This avoids surprising an operator with an automated outbound email for a lead they added as a personal note.
 
@@ -198,7 +195,7 @@ The current (incomplete) day is computed live from raw tables, not from the `Dai
 
 ## 12.1 Data Deletion & Retention
 
-- `Organization` and `Lead` support soft-delete (`deleted_at`). Deleting a `Lead` hard-deletes its PII-bearing children (`LeadEnrichment`, `AIInsight`, `EmailEvent` bodies) and retains only anonymized `WorkflowRunStep` counts needed for historical analytics integrity.
+- `Lead` supports soft-delete (`deleted_at`). Deleting a `Lead` hard-deletes its PII-bearing children (`LeadEnrichment`, `AIInsight`, `EmailEvent` bodies) and retains only anonymized `WorkflowRunStep` counts needed for historical analytics integrity.
 - Propagating a delete request to Airtable (already-synced record) or accounting for data already sent to OpenAI is a **manual/best-effort process for MVP**, not automated — full third-party erasure automation is out of scope until a compliance-driven roadmap phase is scheduled.
 - Analytics CSV/PDF exports (§12) include lead PII; access to export is restricted to Admin/Manager per the RBAC table in §11.
 
@@ -220,6 +217,6 @@ The current (incomplete) day is computed live from raw tables, not from the `Dai
 
 - No leads yet: illustration + "Connect a source or add your first lead" CTA on `/leads` and dashboard table.
 - No AI insight yet (lead not yet processed): "AI qualification pending" placeholder in `AIInsightPanel`.
-- No campaigns created yet: CTA to create first one. (The automation pipeline itself is auto-provisioned per org, not user-created, so `/automation` always has content — its empty state is "no runs yet," not "no pipeline yet.")
+- No campaigns created yet: CTA to create first one. (The automation pipeline itself is auto-provisioned, not user-created, so `/automation` always has content — its empty state is "no runs yet," not "no pipeline yet.")
 - No integrations connected: onboarding-style checklist on `/integrations`.
 - Date range with zero activity: charts render flat/zero state with explanatory caption, not blank.

@@ -4,7 +4,7 @@ Status: v1 — **Phase 0 implemented** (see §11 for what is actually built). Co
 
 ## 1. Guiding Constraints
 
-- Multi-tenant SaaS; every tenant-owned row scoped by `org_id`.
+- Single-tenant: one company per deployment (see §4).
 - The automation pipeline (§8 of product-spec) calls three external APIs per lead (Clearbit, OpenAI, email provider) plus Slack/Airtable — these are slow and can fail, so pipeline execution must be **asynchronous and resumable**, not inline in the request/response cycle.
 - The dashboard needs live-ish workflow status (screenshot shows step checkmarks and an "Active" badge) — steps must report progress observably, not just fire-and-forget.
 - Of the pipeline's external calls, only three are confirmed vendors: **OpenAI GPT-4o** (AI qualification), **Airtable** (CRM sync), **Slack** (notifications). The enrichment provider and the email-sending provider are unconfirmed — the mockup's "Clearbit API" label is illustrative, not a requirement. Architecture must not hard-depend on either; both go behind a swappable provider interface (§9).
@@ -14,7 +14,7 @@ Status: v1 — **Phase 0 implemented** (see §11 for what is actually built). Co
 ```
 ┌─────────────┐      ┌──────────────────┐      ┌─────────────────────┐
 │  Next.js App │◄────►│  API Layer        │◄────►│  PostgreSQL (Prisma) │
-│ (App Router, │      │ (Next.js Route    │      │  org-scoped tables   │
+│ (App Router, │      │ (Next.js Route    │      │                      │
 │  React UI)   │      │  Handlers / REST) │      └─────────────────────┘
 └─────────────┘      └────────┬─────────┘
                                │ enqueue
@@ -63,7 +63,7 @@ Inbound lead capture (webhook/form/ad-platform) hits an API route, writes the `L
 
 **Rationale:**
 
-- **Simplicity for this schema:** `Organization`, `User`, and `role` are already first-class tables in our own Prisma schema (product-spec.md §5). Auth.js writes sessions/accounts directly into that same database — there's no second user store to keep in sync. Clerk and Supabase Auth both own the user record externally, requiring a webhook-driven sync job to mirror users into our `User` table just to satisfy our own `org_id` scoping and RBAC model — that's an extra moving part this MVP doesn't need.
+- **Simplicity for this schema:** `User` and `role` are already first-class in our own Prisma schema (product-spec.md §5). Auth.js writes sessions/accounts directly into that same database — there's no second user store to keep in sync. Clerk and Supabase Auth both own the user record externally, requiring a webhook-driven sync job to mirror users into our `User` table just to satisfy our own RBAC model — that's an extra moving part this MVP doesn't need.
 - **Reliability:** No dependency on a third auth vendor's uptime/API for every login; failure mode is the same as any other query against our own Postgres, which we're already operationally responsible for.
 - **Developer experience:** Auth.js v5 has first-class App Router support (route handlers, middleware, server components) and is the incumbent, best-documented choice for this exact stack; the team isn't adopting a new vendor SDK/dashboard just for auth.
 - **Cost:** Free and self-hosted — no per-MAU billing. Clerk's free tier (10k MAU) is generous but becomes a recurring cost as the org grows; Supabase Auth is free but only if we also adopt Supabase as the DB host, which competes with the Neon decision below.
@@ -96,18 +96,42 @@ Inbound lead capture (webhook/form/ad-platform) hits an API route, writes the `L
 - **Cost:** Neon's free tier is sufficient for MVP development and early production load; scales on usage without requiring adoption of Supabase's broader (and pricier) platform tier as data grows.
 - **Reliability & MVP suitability:** Standard managed Postgres with point-in-time recovery; no functional gap versus Supabase for our purposes since we aren't using Supabase's auth, storage, or edge functions.
 
-## 4. Multi-Tenancy
+## 4. Single Tenant
 
-**Revised after architecture review — this is now a Phase 0 requirement, not deferred hardening:**
+**The application serves one company per deployment.** It was multi-tenant
+through Phase 2; that was removed deliberately, and this section records what
+went with it so nobody reintroduces half of it by accident.
 
-- `org_id` is denormalized onto **every** tenant-owned table, including ones only reachable via a join in the logical model (`LeadEnrichment`, `AIInsight`, `EmailEvent`, `CampaignStep`, `WorkflowRunStep`) — not just the top-level entities (`Lead`, `Campaign`, `Workflow`). This closes the gap where a query that forgets one join hop could silently span tenants.
-- Postgres Row-Level Security (RLS) policies (`org_id = current_setting('app.current_org_id')`) are enabled on all tenant tables **from Phase 0**, as the primary enforcement mechanism — application-layer scoping is a second layer, not the only one. Previously this was described as deferred defense-in-depth; that was a mistake for a multi-tenant SaaS and is corrected here.
-- All API/DB access goes through a query layer that injects `org_id` from the authenticated session; RLS is the backstop if that layer is ever bypassed (a script, an admin tool, a future direct-DB integration).
+Removed:
 
-**Two deployment constraints, both discovered while implementing and verifying this in Phase 0. Neither is optional — either one silently voids every policy above:**
+- The `Organization` model and the `organizationId` column on every table.
+- Postgres Row-Level Security: all policies, `FORCE ROW LEVEL SECURITY`, and
+  the `current_org_id()` helper.
+- `withTenant()` (`lib/db/tenant.ts`) and the `app.current_org_id` session GUC.
+- The four `SECURITY DEFINER` roles and functions that existed ONLY to escape
+  RLS for queries that necessarily run before a tenant is known — the
+  pre-authentication user lookup, the Website Form tenant resolution, and the
+  two cross-tenant recovery sweeps. All four are now ordinary queries on the
+  application's own role, and the privileged one-time provisioning step they
+  required at every deployment is gone with them.
 
-1. **The application's database role must not be a superuser and must not hold `BYPASSRLS`.** PostgreSQL superusers ignore RLS entirely. This was caught by the Phase 0 test suite: the first run of the isolation tests "passed" tenant queries that should have been blocked, purely because the test connection was the bootstrap superuser. Provision a dedicated role (`GRANT SELECT, INSERT, UPDATE, DELETE`, nothing more) for the app's `DATABASE_URL`.
-2. **`FORCE ROW LEVEL SECURITY`, not just `ENABLE`.** Plain `ENABLE` exempts the table's owner. If the app connects as the role that owns the tables — the default when migrations and the app share a role — `ENABLE` alone would leave policies unenforced. Both are set in the RLS migration, and a test asserts `relforcerowsecurity` is true.
+Composite uniques collapsed, and each changed meaning: `Lead` email is now
+globally unique, there is exactly one `Workflow` row per type, and
+`QualificationConfigVersion.version` is a single global sequence.
+
+**What now enforces access control**, since the database no longer does:
+
+1. Role/capability checks in `lib/auth/session.ts` (`requireRole`,
+   `requireCapability`) — unchanged, and still the authorization boundary.
+2. The Lead ownership filter in `lib/services/leads.ts`: a `SALES_REP` sees
+   only leads they own. RLS used to sit underneath this as a second barrier
+   that would catch a forgotten `WHERE`; nothing does now, so this filter is
+   security code and is tested as such.
+
+**One consequence worth stating plainly:** `withTenant()` opened a transaction
+as a side effect of setting tenant context, and several services depended on
+that atomicity without saying so. Every multi-statement sequence now uses an
+explicit `prisma.$transaction()`. Removing one is a correctness change.
 
 ## 5. Data Flow: the pipeline
 
@@ -187,7 +211,7 @@ Phase 0 is implemented. This section records what exists in the repository, so l
 ```
 app/
   (app)/                  # authenticated shell — layout enforces auth
-    layout.tsx            # AppSidebar + auth/organization resolution
+    layout.tsx            # AppSidebar + auth resolution
     dashboard|leads|campaigns|automation|analytics|integrations|settings/
   (auth)/                 # unauthenticated screens
     layout.tsx, login/, signup/, actions.ts
@@ -199,7 +223,7 @@ components/
   ui/                     # shadcn/ui primitives + EmptyState
 lib/
   auth/                   # config.ts (Auth.js), session.ts (DAL), rbac.ts
-  db/                     # prisma.ts (base client), tenant.ts (withTenant)
+  db/                     # prisma.ts (the client), prisma-errors.ts
   services/               # signup.ts — business logic, no request context
   validation/             # Zod schemas
   api/handler.ts          # uniform Route Handler error envelope
@@ -220,27 +244,29 @@ Rule enforced throughout: business logic lives in `lib/services` and `lib/`, nev
 - **Auth.js v5** with the **Prisma adapter** and a **JWT session strategy**. JWT rather than database sessions so `proxy.ts` can do an optimistic check without a database round trip per navigation.
 - **Credentials provider** with bcrypt (cost 12). Sign-in failure is uniform for "no such user" and "wrong password", and a dummy bcrypt comparison runs when the user is absent so response timing does not reveal whether an email is registered.
 - `trustHost: true` is set — required for any non-Vercel deployment, which otherwise fails every auth request with `UntrustedHost`. Because `trustHost` lets Auth.js derive callback URLs from the client-supplied `Host` header, **`AUTH_URL` must be set in production** to pin them.
-- The JWT carries `organizationId` and `role`, but they are treated as a **cache, not the source of truth** — see below.
+- The JWT carries `role`, but it is treated as a **cache, not the source of truth** — see below.
 
-### 11.3 Organization resolution (the multi-tenancy rule)
+### 11.3 Caller resolution
 
 `lib/auth/session.ts` is the Data Access Layer and the only sanctioned way to learn who the caller is:
 
-| Function                                             | Purpose                                  |
-| ---------------------------------------------------- | ---------------------------------------- |
-| `getCurrentUser()`                                   | Signed-in user or `null`                 |
-| `requireUser()`                                      | Same, but throws `UnauthenticatedError`  |
-| `getCurrentOrganization()` / `requireOrganization()` | Current tenant                           |
-| `requireRole(...roles)`                              | Assert role membership                   |
-| `requireCapability(capability)`                      | Assert a capability from the RBAC matrix |
+| Function                        | Purpose                                  |
+| ------------------------------- | ---------------------------------------- |
+| `getCurrentUser()`              | Signed-in user or `null`                 |
+| `requireUser()`                 | Same, but throws `UnauthenticatedError`  |
+| `requireRole(...roles)`         | Assert role membership                   |
+| `requireCapability(capability)` | Assert a capability from the RBAC matrix |
 
-Three properties make this trustworthy, each covered by a test:
+Two properties make this trustworthy, each covered by a test:
 
-- The organization comes from the **session**, never from request input. An `organizationId` in a body, query string, header or route param is never read.
-- The user is **re-read from the database** on each request rather than trusted from the token, so a JWT issued before a role change or user deletion cannot retain privileges. A token claiming a different organization is ignored.
-- A **soft-deleted organization** revokes access immediately, even for a session that was valid when issued.
+- The caller comes from the **session**, never from request input.
+- The user is **re-read from the database** on each request rather than trusted from the token, so a JWT issued before a role change or user deletion cannot retain privileges. The token's `role` claim is a hint for the optimistic proxy check, never the basis of an authorization decision.
 
 `cache()` memoises the lookup per render pass, so a layout plus several server components cost one query.
+
+There is no public sign-up. Accounts are provisioned with `npm run db:seed`
+(see `prisma/seed.ts`), so a role is always set deliberately rather than
+defaulted into by whoever registers first.
 
 ### 11.4 RBAC architecture
 
@@ -251,31 +277,26 @@ Enforcement is server-side, at the page/action. The sidebar filters items by cap
 ### 11.5 Database architecture
 
 - PostgreSQL + Prisma 7. **Prisma 7 breaking change:** the datasource URL is no longer permitted in `schema.prisma`; it lives in `prisma.config.ts` for CLI/migrations and reaches the runtime client through the `@prisma/adapter-pg` driver adapter.
-- Phase 0 models only: `Organization`, `User`, plus the Auth.js models (`Account`, `Session`, `VerificationToken`). No business models — those belong to Phase 1+.
-- `User.email` is **globally unique, not unique-per-organization**. Auth.js resolves a login identity by email before any organization context exists, so a per-org constraint would make sign-in ambiguous. The accepted consequence: one email maps to one organization. Multi-org membership would need a `Membership` join model and an org-selection step at login — deliberately out of scope.
-- Two clients, with different jobs:
-  - `lib/db/prisma.ts` — base client, **no tenant context**. Under RLS it matches zero rows for tenant tables, so forgetting to scope fails closed. Legitimate uses: pre-authentication lookups and signup, where no organization exists yet.
-  - `lib/db/tenant.ts` — `withTenant(organizationId, work)` runs `work` inside a transaction that first issues `set_config('app.current_org_id', $1, true)`. The id is a **bound parameter**, not interpolated SQL.
+- Phase 0 models only: `User`, plus the Auth.js models (`Account`, `Session`, `VerificationToken`). No business models — those belong to Phase 1+.
+- `User.email` is globally unique — Auth.js resolves a login identity by email.
+- One client: `lib/db/prisma.ts`. Services use it directly, and reach for `prisma.$transaction()` wherever a sequence of statements must see one snapshot (see §4).
 
-`SET LOCAL` semantics matter here: the setting is transaction-scoped and discarded at commit, so it cannot leak onto a pooled connection later reused by another tenant. A plain `SET` would.
+### 11.6 Migrations
 
-### 11.6 RLS approach
+`prisma/migrations/0_init/migration.sql` is the whole schema. It replaced the
+ten migrations that existed while the product was multi-tenant, which is why
+the history starts at one file rather than tracking the tenancy removal as a
+forward migration — there was no deployed data to preserve.
 
-`prisma/migrations/20260901000100_rls/migration.sql` installs, per tenant table:
+It ends with three hand-written indexes Prisma cannot express, all on
+`workflow_runs`. Two are PARTIAL unique indexes and are **load-bearing, not
+optimizations**: they are what make duplicate event delivery and concurrent
+execution safe at the database level rather than by application timing. They
+are proven against real Postgres in
+`tests/integration/automation-execution.test.ts`. Do not drop them by
+regenerating the schema from the database.
 
-```sql
-ALTER TABLE "users" ENABLE ROW LEVEL SECURITY;
-ALTER TABLE "users" FORCE  ROW LEVEL SECURITY;
-CREATE POLICY "users_tenant_isolation" ON "users"
-  FOR ALL USING ("organizationId" = current_org_id())
-  WITH CHECK ("organizationId" = current_org_id());
-```
-
-`current_org_id()` reads `current_setting('app.current_org_id', true)` in its missing-ok form, so an **unset context matches zero rows** — forgetting tenant context returns nothing rather than everything. `WITH CHECK` covers the write direction, so a tenant cannot plant a row inside another organization.
-
-The Auth.js tables (`accounts`, `sessions`, `verification_tokens`) are **deliberately excluded**: Auth.js must read them during sign-in, before any organization is known, so a policy there could only be "always true" — no security gained, authentication broken. Isolation begins one hop later, once the session resolves to a user and `organizationId` is derived.
-
-See §4 for the two deployment constraints (non-superuser role; `FORCE`) that this depends on.
+There is no row level security — see §4.
 
 ### 11.7 Environment configuration
 
@@ -295,6 +316,6 @@ See §4 for the two deployment constraints (non-superuser role; `FORCE`) that th
 
 **Vitest** (chosen in Phase 0; no stack pre-existed) with two projects: `node` for logic/security/database tests, `jsdom` for components.
 
-The notable choice is **PGlite** — real PostgreSQL compiled to WASM — for database tests. It runs in-process with no Docker, no server and no external dependency, while behaving like genuine Postgres: RLS, policies, roles, constraints and `current_setting()` all work. The tests apply **the same migration files** Prisma will run in production, so they validate the migration SQL as well as the policies. A mock could not have caught the superuser-bypass problem described in §4; PGlite did.
+The notable choice is **PGlite** — real PostgreSQL compiled to WASM — for database tests. It runs in-process with no Docker, no server and no external dependency, while behaving like genuine Postgres: constraints, partial indexes and transaction semantics all work. The tests apply **the same migration files** Prisma will run in production, so they validate the migration SQL too. This is what proves the two partial unique indexes in §11.6 actually exist and bite — a fake could only restate our assumptions about them.
 
 `server-only` is aliased to an empty stub under Vitest so server modules are importable in tests. The real guard remains active in the application build.

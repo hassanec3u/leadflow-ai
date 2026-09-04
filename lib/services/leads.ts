@@ -7,7 +7,7 @@ export type { Lead }
 
 import { hasCapability } from '@/lib/auth/rbac'
 import { requireUser, type CurrentUser } from '@/lib/auth/session'
-import { withTenant, type TenantDb } from '@/lib/db/tenant'
+import { prisma } from '@/lib/db/prisma'
 import {
   AppError,
   ConflictError,
@@ -33,16 +33,20 @@ import {
  * Business logic lives here, not in the UI or an API route — this module is
  * meant to be called from both, later. Every exported function:
  *
- *  1. Resolves the caller via `requireUser()` — the organization is ALWAYS
- *     derived from the session, never accepted as a parameter.
- *  2. Runs its queries through `withTenant()`, so Postgres RLS is the backstop
- *     even if the ownership filter below were ever wrong or bypassed.
- *  3. Applies the ownership scoping rule from docs/product-spec.md §11: a
+ *  1. Resolves the caller via `requireUser()` — identity is ALWAYS derived
+ *     from the session, never accepted as a parameter.
+ *  2. Applies the ownership scoping rule from docs/product-spec.md §11: a
  *     SALES_REP may only see/edit/delete Leads they own; ADMIN/MANAGER see
- *     and edit/reassign any Lead in the org. This mirrors the comment already
- *     in lib/auth/rbac.ts — "a rep's access to leads is scoped to records
- *     they own, which is an ownership filter applied at query time" — rather
- *     than inventing a new capability.
+ *     and edit/reassign any Lead. This mirrors the comment already in
+ *     lib/auth/rbac.ts — "a rep's access to leads is scoped to records they
+ *     own, which is an ownership filter applied at query time" — rather than
+ *     inventing a new capability.
+ *
+ * THE OWNERSHIP FILTER IS THE ONLY THING SCOPING READS. While the product was
+ * multi-tenant, Postgres RLS sat underneath as a second barrier that caught a
+ * forgotten WHERE clause. Single-tenant there are no other tenants' rows to
+ * leak, so that barrier is gone and this filter stands alone — treat it as
+ * load-bearing, and keep it covered by tests.
  *
  * Not implemented here (explicitly out of scope for Phase 1B): CSV import,
  * public lead capture, AI qualification, workflow enrollment. `status`,
@@ -94,13 +98,16 @@ function isUniqueEmailViolation(error: unknown): boolean {
  *   owner to anyone but themselves. Naming someone else is a reassignment
  *   attempt, which is ADMIN/MANAGER-only — rejected, not silently overridden,
  *   so a misbehaving/compromised client is surfaced rather than hidden.
- * - A caller WITH `leads:edit:all` may name any `ownerId`, but it must
- *   resolve to a user in the same organization. The lookup runs on `tx`
- *   (already tenant-scoped), so RLS itself makes a cross-org id invisible —
- *   no separate cross-tenant check is needed.
+ * - A caller WITH `leads:edit:all` may name any `ownerId`, but it must resolve
+ *   to a user that actually exists. (While the product was multi-tenant this
+ *   lookup leaned on RLS to also prove the user was in the caller's
+ *   organization; there is one set of users now, so existence is the whole
+ *   check.) The FK on Lead.ownerId is the real guard against a concurrent
+ *   deletion — this lookup exists to turn that into a field-level validation
+ *   error rather than a raw constraint violation.
  */
 async function resolveOwnerId(
-  tx: TenantDb,
+  tx: Prisma.TransactionClient,
   user: CurrentUser,
   requestedOwnerId: string | null | undefined,
 ): Promise<string | null> {
@@ -122,7 +129,7 @@ async function resolveOwnerId(
   const owner = await tx.user.findUnique({ where: { id: ownerId }, select: { id: true } })
   if (!owner) {
     throw new ValidationError('Invalid lead details.', {
-      ownerId: ['Owner must be a member of your organization.'],
+      ownerId: ['Owner must be an existing user.'],
     })
   }
   return ownerId
@@ -159,12 +166,13 @@ export async function createLead(rawInput: unknown): Promise<Lead> {
   const input: CreateLeadInput = parsed.data
 
   try {
-    return await withTenant(user.organizationId, async (tx) => {
+    // Transaction: the owner lookup and the insert must agree on one snapshot,
+    // exactly as they did when withTenant() supplied the transaction.
+    return await prisma.$transaction(async (tx) => {
       const ownerId = await resolveOwnerId(tx, user, input.ownerId)
 
       return tx.lead.create({
         data: {
-          organizationId: user.organizationId,
           ownerId,
           name: input.name,
           email: input.email,
@@ -176,11 +184,11 @@ export async function createLead(rawInput: unknown): Promise<Lead> {
     })
   } catch (error) {
     if (isUniqueEmailViolation(error)) {
-      throw new ConflictError('A lead with that email already exists in your organization.')
+      throw new ConflictError('A lead with that email already exists.')
     }
     if (error instanceof AppError) throw error
 
-    logger.error('Failed to create lead', { organizationId: user.organizationId, cause: error })
+    logger.error('Failed to create lead', { userId: user.id, cause: error })
     throw error
   }
 }
@@ -189,11 +197,9 @@ export async function getLead(id: string): Promise<Lead> {
   const user = await requireUser()
   const capable = canViewAllLeads(user)
 
-  const lead = await withTenant(user.organizationId, (tx) =>
-    tx.lead.findFirst({
-      where: { id, deletedAt: null, ...ownershipFilter(user, capable) },
-    }),
-  )
+  const lead = await prisma.lead.findFirst({
+    where: { id, deletedAt: null, ...ownershipFilter(user, capable) },
+  })
 
   // A rep naming a real lead they don't own gets the same NotFoundError as a
   // nonexistent id — existence of another rep's lead is not disclosed.
@@ -252,21 +258,21 @@ export async function listLeads(rawQuery: unknown): Promise<ListLeadsResult> {
       : {}),
   }
 
-  const [leads, total] = await withTenant(user.organizationId, (tx) =>
-    Promise.all([
-      tx.lead.findMany({
-        where,
-        orderBy: { [query.sortBy]: query.sortDirection },
-        skip: (query.page - 1) * query.pageSize,
-        take: query.pageSize,
-        // The UI displays the owner's name (docs/product-spec.md §5 "Lead N—1
-        // User (owner)") — included here rather than looked up separately by
-        // the UI, which would duplicate tenant-scoped access logic.
-        include: { owner: { select: { id: true, name: true, email: true } } },
-      }),
-      tx.lead.count({ where }),
-    ]),
-  )
+  // Transaction: the page and its total must come from one snapshot, or a
+  // concurrent insert makes the reported total disagree with the rows shown.
+  const [leads, total] = await prisma.$transaction([
+    prisma.lead.findMany({
+      where,
+      orderBy: { [query.sortBy]: query.sortDirection },
+      skip: (query.page - 1) * query.pageSize,
+      take: query.pageSize,
+      // The UI displays the owner's name (docs/product-spec.md §5 "Lead N—1
+      // User (owner)") — included here rather than looked up separately by
+      // the UI, which would duplicate access logic.
+      include: { owner: { select: { id: true, name: true, email: true } } },
+    }),
+    prisma.lead.count({ where }),
+  ])
 
   return { leads, total, page: query.page, pageSize: query.pageSize }
 }
@@ -284,7 +290,9 @@ export async function updateLead(id: string, rawInput: unknown): Promise<Lead> {
   const capable = canEditAllLeads(user)
 
   try {
-    return await withTenant(user.organizationId, async (tx) => {
+    // Transaction: the ownership check and the update must not be separated —
+    // between them the lead could be reassigned out from under the caller.
+    return await prisma.$transaction(async (tx) => {
       const existing = await tx.lead.findFirst({
         where: { id, deletedAt: null, ...ownershipFilter(user, capable) },
         select: { id: true },
@@ -309,12 +317,12 @@ export async function updateLead(id: string, rawInput: unknown): Promise<Lead> {
     })
   } catch (error) {
     if (isUniqueEmailViolation(error)) {
-      throw new ConflictError('A lead with that email already exists in your organization.')
+      throw new ConflictError('A lead with that email already exists.')
     }
     if (error instanceof AppError) throw error
 
     logger.error('Failed to update lead', {
-      organizationId: user.organizationId,
+      userId: user.id,
       leadId: id,
       cause: error,
     })
@@ -342,10 +350,10 @@ export type ImportLeadsResult = {
  * Imports Leads from already-parsed CSV rows (see lib/csv.ts for parsing).
  *
  * Each row is validated and created independently through `createLead()` —
- * the exact same schema, tenancy, and uniqueness rules a manually-created
+ * the exact same schema, ownership, and uniqueness rules a manually-created
  * Lead goes through. Nothing here talks to the database directly: reusing
  * `createLead()` is what guarantees a CSV row can't take a shortcut around
- * validation, RLS, or the organizationId-from-session rule.
+ * validation or the ownership rules.
  *
  * A row's failure (validation error, duplicate email) never aborts the
  * batch — it's recorded and the next row is attempted, so one bad row
@@ -408,7 +416,8 @@ export async function deleteLead(id: string): Promise<void> {
   const user = await requireUser()
   const capable = canEditAllLeads(user)
 
-  await withTenant(user.organizationId, async (tx) => {
+  // Transaction: same check-then-write pairing as updateLead.
+  await prisma.$transaction(async (tx) => {
     const existing = await tx.lead.findFirst({
       where: { id, deletedAt: null, ...ownershipFilter(user, capable) },
       select: { id: true },

@@ -31,7 +31,7 @@ export type LeadFacts = {
   source: string
 }
 
-export type ProviderCall = { idempotencyKey: string; organizationId: string }
+export type ProviderCall = { idempotencyKey: string }
 
 /**
  * Seniority buckets (Phase 2D-3).
@@ -198,12 +198,15 @@ export interface NotificationProvider {
 }
 
 /**
- * Per-organization AI spend guard, checked BEFORE the AI provider is called
+ * AI spend guard, checked BEFORE the AI provider is called
  * (docs/architecture.md §7). Throws to refuse; exceeding a budget is not
  * retriable, so it must throw a non-retriable error.
+ *
+ * Deployment-wide rather than per-organization: there is one tenant, so there
+ * is one budget.
  */
 export interface AiBudgetGuard {
-  assertWithinBudget(organizationId: string): Promise<void>
+  assertWithinBudget(): Promise<void>
 }
 
 export type ProviderRegistry = {

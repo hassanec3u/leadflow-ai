@@ -2,18 +2,19 @@ import bcrypt from 'bcryptjs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 /**
- * Covers scenarios 2-4 of the auth-lookup fix: valid credentials succeed,
- * an invalid password is rejected, and an unknown email is rejected the same
- * way (uniform failure, so the response never reveals whether an account
- * exists). Scenario 1 and the RLS/privilege guarantees (5-9) are covered in
- * tests/integration/auth-lookup-security-definer.test.ts against real
- * PostgreSQL.
+ * Valid credentials succeed, an invalid password is rejected, and an unknown
+ * email is rejected the SAME way — uniform failure, so the response never
+ * reveals whether an account exists.
+ *
+ * The user lookup is doubled here. It used to be a dedicated SECURITY DEFINER
+ * module (lib/auth/auth-lookup.ts) that existed only to read `users` before a
+ * tenant context could exist; single-tenant it is an ordinary Prisma read.
  */
 
 const findUserMock = vi.fn()
 
-vi.mock('@/lib/auth/auth-lookup', () => ({
-  findUserForAuthentication: (...args: unknown[]) => findUserMock(...args),
+vi.mock('@/lib/db/prisma', () => ({
+  prisma: { user: { findUnique: (...args: unknown[]) => findUserMock(...args) } },
 }))
 
 const KNOWN_USER = {
@@ -21,7 +22,6 @@ const KNOWN_USER = {
   email: 'admin@acme.test',
   name: 'Admin',
   image: null,
-  organizationId: 'org_acme',
   role: 'ADMIN' as const,
 }
 
@@ -38,7 +38,7 @@ describe('verifyCredentials', () => {
     const { verifyCredentials } = await import('@/lib/auth/verify-credentials')
     const result = await verifyCredentials('admin@acme.test', 'correct-horse-battery-staple')
 
-    expect(result).toMatchObject({ id: 'user_1', organizationId: 'org_acme', role: 'ADMIN' })
+    expect(result).toMatchObject({ id: 'user_1', email: 'admin@acme.test', role: 'ADMIN' })
     // The hash itself must never be part of the returned session-worthy shape.
     expect(result).not.toHaveProperty('passwordHash')
   })
